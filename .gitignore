@@ -1,0 +1,30 @@
+.env
+data/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm
+
+# ---- 打包产物（packaging/build.ps1 生成，不入库）----
+build/
+dist/
+releases/
+output/
+
+# ---- 工具二进制：体积大（约 88MB），分发时外置，不从 git 拉 ----
+tools/ngrok/
+tools/*.exe
+tools/cloudflared.exe
+
+# ---- 运行日志 ----
+*.log
+
+# ---- Android 构建产物 ----
+android/dist/
+android/.gradle/
+android/.kotlin/
+android/local.properties
+android/app/build/

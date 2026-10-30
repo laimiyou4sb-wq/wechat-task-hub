@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">微信待办</string>
+    <string name="notification_channel_tasks">新待办</string>
+    <string name="notification_channel_tasks_desc">同步后出现新待办时的汇总通知</string>
+    <string name="notification_channel_reminder">到点提醒</string>
+    <string name="notification_channel_reminder_desc">任务到截止时间时提醒你</string>
+</resources>

@@ -1,0 +1,10 @@
+<resources>
+    <!-- Compose 负责绘制，这里只提供无 ActionBar 的宿主窗口 -->
+    <style name="Theme.WeChatTask" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowBackground">@color/splash_background</item>
+    </style>
+</resources>

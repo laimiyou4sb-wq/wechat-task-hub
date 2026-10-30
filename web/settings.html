@@ -1,0 +1,568 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="robots" content="noindex">
+  <title>设置 · 微信待办</title>
+  <link rel="icon" href="./icons/icon-192.png">
+  <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./settings.css?v=20261029-1">
+</head>
+<body class="settings-page">
+  <header class="settings-header">
+    <div class="settings-header__inner">
+      <a class="back-link" href="./">← 返回</a>
+      <h1>设置</h1>
+      <span class="settings-tag">SETTINGS</span>
+      <span class="settings-header__spacer"></span>
+      <span id="llmStatus" class="status-pill status-pill--muted">读取中…</span>
+    </div>
+  </header>
+
+  <div class="settings-shell">
+    <aside class="settings-rail" aria-label="设置分区导航">
+      <p class="settings-rail__label">SECTIONS</p>
+      <nav class="settings-nav">
+        <a class="settings-nav-item is-active" href="#sec-llm" data-target="sec-llm">
+          <span class="settings-nav-item__idx">01</span>
+          <span class="settings-nav-item__text">大模型</span>
+          <span class="settings-nav-item__code">LLM</span>
+        </a>
+        <a class="settings-nav-item" href="#sec-filter" data-target="sec-filter">
+          <span class="settings-nav-item__idx">02</span>
+          <span class="settings-nav-item__text">消息范围与白名单</span>
+          <span class="settings-nav-item__code">FILTER</span>
+        </a>
+        <a class="settings-nav-item" href="#sec-identity" data-target="sec-identity">
+          <span class="settings-nav-item__idx">03</span>
+          <span class="settings-nav-item__text">身份与判定</span>
+          <span class="settings-nav-item__code">IDENT</span>
+        </a>
+        <a class="settings-nav-item" href="#sec-status" data-target="sec-status">
+          <span class="settings-nav-item__idx">04</span>
+          <span class="settings-nav-item__text">运行状态</span>
+          <span class="settings-nav-item__code">STATUS</span>
+        </a>
+        <a class="settings-nav-item" href="#appCard" data-target="appCard">
+          <span class="settings-nav-item__idx">05</span>
+          <span class="settings-nav-item__text">手机 App</span>
+          <span class="settings-nav-item__code">APP</span>
+        </a>
+        <a class="settings-nav-item" href="#sec-other" data-target="sec-other">
+          <span class="settings-nav-item__idx">06</span>
+          <span class="settings-nav-item__text">其余配置</span>
+          <span class="settings-nav-item__code">MISC</span>
+        </a>
+      </nav>
+      <div class="settings-rail__foot">
+        <p>保存后立即生效，无需重启</p>
+        <p class="settings-rail__mono">UNSAVED <b id="dirtyCount">0</b></p>
+      </div>
+    </aside>
+
+    <main class="settings-main">
+      <div class="settings-cards">
+        <section class="card settings-section" id="sec-llm">
+          <div class="card-head">
+            <h2><span class="card-kicker">01</span>大模型（LLM）</h2>
+            <span id="llmKeyHint" class="key-hint"></span>
+          </div>
+          <p class="card-desc">
+            用于把微信消息归纳成待办、提取截止时间。不配置也能用，但会退化为本地规则模式。
+          </p>
+
+          <form id="llmForm" novalidate>
+            <label class="field">
+              <span>API Key</span>
+              <div class="key-row">
+                <input id="apiKey" type="password" autocomplete="new-password" spellcheck="false"
+                       placeholder="粘贴 sk-...（留空表示不修改）">
+                <button type="button" id="toggleKey" class="mini-btn">显示</button>
+              </div>
+            </label>
+
+            <div class="field-row">
+              <label class="field">
+                <span>Base URL</span>
+                <input id="baseUrl" type="url" autocomplete="off" spellcheck="false"
+                       placeholder="https://api.deepseek.com/v1">
+              </label>
+
+              <label class="field">
+                <span>模型名</span>
+                <input id="model" type="text" autocomplete="off" spellcheck="false"
+                       placeholder="deepseek-chat">
+              </label>
+            </div>
+
+            <label class="switch-row">
+              <input id="enabled" type="checkbox">
+              <span>启用 LLM 归纳</span>
+            </label>
+
+            <p id="formError" class="form-error" hidden></p>
+
+            <div class="form-actions">
+              <button type="submit" id="saveBtn" class="btn-primary">保存</button>
+              <button type="button" id="testBtn" class="btn-secondary">测试连接</button>
+              <button type="button" id="clearBtn" class="btn-ghost">清除 Key</button>
+            </div>
+          </form>
+
+          <p id="testResult" class="test-result" hidden></p>
+
+          <p class="privacy-note">
+            归纳阶段会把筛选后的消息文本发给你填写的 API。想完全本地运行，可填 Ollama：
+            <code>http://127.0.0.1:11434/v1</code> + 模型 <code>qwen2.5:7b</code>。
+          </p>
+        </section>
+
+        <section class="card settings-section" id="sec-filter">
+          <div class="card-head">
+            <h2><span class="card-kicker">02</span>消息范围与白名单</h2>
+            <span id="filterStatus" class="status-pill status-pill--muted">读取中…</span>
+          </div>
+          <p class="card-desc">
+            决定哪些聊天会进入归纳。置顶模式会自动同步微信里置顶的会话（群聊和私聊都按此判断）。
+          </p>
+          <form id="filterForm" novalidate>
+            <label class="switch-row">
+              <input id="includePrivate" type="checkbox">
+              <span>包含私聊消息</span>
+            </label>
+            <label class="field field--sm">
+              <span>白名单模式</span>
+              <select id="whitelistMode" class="select-input">
+                <option value="pinned">仅置顶聊天（推荐）</option>
+                <option value="pinned_custom">置顶聊天 + 自定义名单</option>
+                <option value="custom">仅自定义名单</option>
+                <option value="all">全部群聊 / 私聊</option>
+              </select>
+            </label>
+            <p id="pinnedInfo" class="hint-line"></p>
+            <label class="field">
+              <span>自定义名单（群名 / 联系人备注 / wxid，每行一个或用逗号分隔）</span>
+              <textarea id="whitelist" class="textarea-input" rows="4"
+                        placeholder="项目群&#10;课程群&#10;张三&#10;wxid_xxxx"></textarea>
+            </label>
+            <p id="filterError" class="form-error" hidden></p>
+            <div class="form-actions">
+              <button type="submit" id="filterSaveBtn" class="btn-primary">保存范围</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="card settings-section" id="sec-identity">
+          <div class="card-head">
+            <h2><span class="card-kicker">03</span>身份与判定</h2>
+            <span id="identityStatus" class="status-pill status-pill--muted">读取中…</span>
+          </div>
+          <p class="card-desc">
+            自动判断群消息是不是在找你：@ 到别人、点名指派别人的消息不再生成待办；@ 你或没有指定对象的消息照旧处理。
+          </p>
+
+          <div id="identityError" class="identity-error" hidden>
+            <p id="identityErrorText">读取身份设置失败。</p>
+            <button type="button" id="identityRetryBtn" class="mini-btn">重试</button>
+          </div>
+
+          <div id="identityBody" hidden>
+            <div class="identity-summary">
+              <div class="identity-summary-item">
+                <span>我的微信账号</span>
+                <strong id="identityAccount" class="identity-account">—</strong>
+              </div>
+              <div class="identity-summary-item">
+                <span>识别来源</span>
+                <strong id="identitySource">—</strong>
+              </div>
+            </div>
+
+            <div class="identity-chips-row">
+              <span class="identity-chips-label">自动识别昵称</span>
+              <div id="identityAutoNames" class="identity-chips"></div>
+            </div>
+
+            <form id="identityForm" novalidate>
+              <label class="field">
+                <span>手动别名（每行一个，也可用逗号分隔）</span>
+                <textarea id="identityNames" class="textarea-input" rows="3"
+                          placeholder="大王&#10;老王&#10;001大王"></textarea>
+              </label>
+              <p class="hint-line">
+                外号、同音字、错别字写法都可以填在这里；自动识别到的昵称不用重复填写。
+              </p>
+
+              <label class="field">
+                <span>我的 wxid（可选，留空表示自动识别）</span>
+                <input id="identityWxid" class="mono-input" type="text" autocomplete="off"
+                       spellcheck="false" placeholder="留空表示自动识别（推荐）">
+              </label>
+
+              <label class="switch-row">
+                <input id="identityFilter" type="checkbox">
+                <span>启用「@/点名」过滤（指向他人的消息直接丢弃）</span>
+              </label>
+              <label class="switch-row">
+                <input id="identityFuzzy" type="checkbox">
+                <span>开启错别字 / 同音模糊匹配</span>
+              </label>
+
+              <p id="identityFormError" class="form-error" hidden></p>
+
+              <div class="form-actions">
+                <button type="submit" id="identitySaveBtn" class="btn-primary">保存身份与判定</button>
+                <button type="button" id="identityRefreshBtn" class="btn-secondary">刷新身份</button>
+              </div>
+            </form>
+
+            <div class="identity-subsection">
+              <div class="identity-subhead">
+                <h3 class="identity-subtitle">各群「我的群昵称」</h3>
+                <span id="identityGroupsHint" class="key-hint"></span>
+              </div>
+              <div class="identity-table-wrap">
+                <table class="identity-table" id="identityGroupsTable" hidden>
+                  <thead>
+                    <tr>
+                      <th>群名</th>
+                      <th>我的群昵称</th>
+                      <th>成员</th>
+                      <th>更新时间</th>
+                      <th>状态</th>
+                    </tr>
+                  </thead>
+                  <tbody id="identityGroupsBody"></tbody>
+                </table>
+              </div>
+              <p id="identityGroupsEmpty" class="hint-line">
+                还没有群成员缓存：收到该群消息或点「刷新身份」后显示。
+              </p>
+            </div>
+
+            <div class="identity-subsection">
+              <div class="identity-subhead">
+                <h3 class="identity-subtitle">判定测试</h3>
+                <span id="identityCheckHint" class="key-hint">不改动任何数据</span>
+              </div>
+              <p class="hint-line">
+                粘贴一条群消息，先用规则判断它会「需要我参与 / @所有人 / 指向他人 / 未指定」。
+              </p>
+              <label class="field">
+                <span>消息原文</span>
+                <textarea id="identityCheckText" class="textarea-input" rows="2"
+                          placeholder="@001大王 明天交表"></textarea>
+              </label>
+              <label class="field">
+                <span>按哪个群判定（可选）</span>
+                <select id="identityCheckGroup" class="select-input">
+                  <option value="">不指定群（只用全局别名）</option>
+                </select>
+              </label>
+              <div class="identity-examples">
+                <button type="button" class="mini-btn" data-example="@001大王 明天交表">示例：@我</button>
+                <button type="button" class="mini-btn" data-example="@某某 你去交一下表">示例：@别人</button>
+                <button type="button" class="mini-btn" data-example="明天下午三点开会">示例：没指定对象</button>
+              </div>
+              <div class="form-actions">
+                <button type="button" id="identityCheckBtn" class="btn-secondary">开始判定</button>
+              </div>
+              <p id="identityCheckError" class="test-result err" hidden></p>
+              <div id="identityCheckResult" class="identity-result" hidden>
+                <div class="identity-result-head">
+                  <span id="identityVerdictBadge" class="identity-badge">—</span>
+                  <span id="identityVerdictSource" class="key-hint"></span>
+                </div>
+                <dl class="identity-result-meta">
+                  <div><dt>原因</dt><dd id="identityVerdictReason">—</dd></div>
+                  <div><dt>命中对象</dt><dd id="identityVerdictTargets">—</dd></div>
+                  <div><dt>群昵称</dt><dd id="identityVerdictNickname">—</dd></div>
+                  <div><dt>成员数</dt><dd id="identityVerdictMembers">—</dd></div>
+                </dl>
+              </div>
+            </div>
+
+            <div class="identity-subsection">
+              <div class="identity-subhead">
+                <h3 class="identity-subtitle">最近过滤</h3>
+                <span id="identityDropsCount" class="key-hint"></span>
+              </div>
+              <p id="identityJudgments" class="identity-meta-line"></p>
+              <div class="identity-table-wrap">
+                <table class="identity-table identity-table--drops" id="identityDropsTable" hidden>
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>群</th>
+                      <th>发送者</th>
+                      <th>命中对象</th>
+                      <th>原文</th>
+                    </tr>
+                  </thead>
+                  <tbody id="identityDropsBody"></tbody>
+                </table>
+              </div>
+              <p id="identityDropsEmpty" class="hint-line">暂无过滤记录。</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="card settings-section" id="sec-status">
+          <div class="card-head">
+            <h2><span class="card-kicker">04</span>运行状态</h2>
+            <span id="statusPill" class="status-pill status-pill--muted">读取中…</span>
+          </div>
+          <p class="card-desc">
+            数据源、补采、置顶同步与事项账本的当前快照，全部来自 <code>GET /api/health</code>；
+            补采为全自动运行（参数与上次结果见下方「补采」），置顶同步只刷新监控范围。
+          </p>
+
+          <div id="statusError" class="identity-error" hidden>
+            <p id="statusErrorText">读取运行状态失败。</p>
+            <button type="button" id="statusRetryBtn" class="mini-btn">重试</button>
+          </div>
+
+          <div id="statusBody" hidden>
+            <div class="identity-subsection">
+              <div class="identity-subhead">
+                <h3 class="identity-subtitle">数据源</h3>
+              </div>
+              <div class="caldav-meta status-grid">
+                <div class="caldav-meta-item">
+                  <span>类型</span>
+                  <strong id="statusSourceType">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>连接</span>
+                  <strong id="statusSourceConnected">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>实时流</span>
+                  <strong id="statusStreams">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>最近消息</span>
+                  <strong id="statusLastEvent">—</strong>
+                </div>
+              </div>
+              <p id="statusSourceError" class="test-result err" hidden></p>
+            </div>
+
+            <div class="identity-subsection">
+              <div class="identity-subhead">
+                <h3 class="identity-subtitle">补采</h3>
+                <span id="statusCatchupHint" class="key-hint"></span>
+              </div>
+              <div class="caldav-meta status-grid">
+                <div class="caldav-meta-item">
+                  <span>模式</span>
+                  <strong id="statusCatchupMode">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>间隔</span>
+                  <strong id="statusCatchupInterval">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>最小回看</span>
+                  <strong id="statusCatchupLookback">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>单会话最长回看</span>
+                  <strong id="statusCatchupMax">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>新会话回看</span>
+                  <strong id="statusCatchupEmpty">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>分页大小</span>
+                  <strong id="statusCatchupPageSize">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>每轮预算</span>
+                  <strong id="statusCatchupBudget">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>启动额外回补</span>
+                  <strong id="statusCatchupBackfill">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>会话水位</span>
+                  <strong id="statusCatchupWatermarks">—</strong>
+                </div>
+              </div>
+              <p id="statusCatchupLast" class="hint-line">上次补采：尚未执行</p>
+              <p class="hint-line">
+                补采全自动运行：启动 8 秒后先按水位补一次，之后每轮按会话水位续补；
+                读取失败或积压超限的会话保留水位，下一轮自动重试，无需手动触发。
+              </p>
+            </div>
+
+            <div class="identity-subsection">
+              <div class="identity-subhead">
+                <h3 class="identity-subtitle">置顶</h3>
+                <span id="statusPinnedHint" class="key-hint"></span>
+              </div>
+              <div class="caldav-meta status-grid">
+                <div class="caldav-meta-item">
+                  <span>模式</span>
+                  <strong id="statusWhitelistMode">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>置顶数</span>
+                  <strong id="statusPinnedCount">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>就绪</span>
+                  <strong id="statusPinnedReady">—</strong>
+                </div>
+              </div>
+              <div class="form-actions">
+                <button type="button" id="pinnedRefreshBtn" class="btn-secondary">同步置顶</button>
+              </div>
+              <p id="pinnedResult" class="test-result" hidden></p>
+            </div>
+
+            <div class="identity-subsection">
+              <div class="identity-subhead">
+                <h3 class="identity-subtitle">事项账本</h3>
+              </div>
+              <div class="caldav-meta status-grid">
+                <div class="caldav-meta-item">
+                  <span>开放事项</span>
+                  <strong id="statusEventsOpen">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>缓冲会话</span>
+                  <strong id="statusBufferedSessions">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>缓冲消息</span>
+                  <strong id="statusBufferedMessages">—</strong>
+                </div>
+              </div>
+            </div>
+
+            <div class="identity-subsection">
+              <div class="identity-subhead">
+                <h3 class="identity-subtitle">概况</h3>
+                <span id="statusVersion" class="key-hint"></span>
+              </div>
+              <div class="caldav-meta status-grid">
+                <div class="caldav-meta-item">
+                  <span>LLM</span>
+                  <strong id="statusLlm">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>待办</span>
+                  <strong id="statusTasksPending">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>仅新消息</span>
+                  <strong id="statusOnlyNew">—</strong>
+                </div>
+              </div>
+            </div>
+
+            <div class="status-foot">
+              <p class="hint-line">数字为服务端最近一次统计，点「刷新状态」重新读取；补采为全自动运行，明细见「补采」。</p>
+              <div class="form-actions">
+                <button type="button" id="statusRefreshBtn" class="btn-ghost">刷新状态</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card settings-section" id="appCard">
+          <div class="card-head">
+            <h2><span class="card-kicker">05</span>手机 App（直连同步）</h2>
+            <span id="appStatus" class="status-pill status-pill--muted">读取中…</span>
+          </div>
+          <p class="card-desc">
+            在手机安装自研的「微信待办」App，把下方配对码复制到 App 的「设置 → 粘贴配对码」即可。
+            不依赖第三方待办 App，也不需要第三方代理服务：回家走局域网直连，出门走 ngrok 固定域名，
+            App 自动切换。
+          </p>
+
+          <div class="caldav-grid">
+            <div class="caldav-row caldav-row--wide">
+              <span class="caldav-label">配对码（复制到手机 App）</span>
+              <div class="key-row">
+                <input id="appPairCode" class="mono-input" type="text" readonly
+                       autocomplete="off" spellcheck="false" aria-label="手机 App 配对码">
+                <button type="button" id="appCopyCode" class="mini-btn">复制</button>
+              </div>
+            </div>
+            <div class="caldav-row caldav-row--wide">
+              <span class="caldav-label">可用地址（App 按顺序尝试）</span>
+              <div id="appEndpoints" class="code-block app-endpoints" style="margin:0;white-space:pre-wrap">—</div>
+            </div>
+          </div>
+
+          <div class="caldav-meta">
+            <div class="caldav-meta-item">
+              <span>手机最近同步</span>
+              <strong id="appLastSync">—</strong>
+            </div>
+            <div class="caldav-meta-item">
+              <span>来源地址</span>
+              <strong id="appLastSyncClient">—</strong>
+            </div>
+            <div class="caldav-meta-item">
+              <span>本地缓存待办</span>
+              <strong id="appTaskCount">—</strong>
+            </div>
+          </div>
+
+          <p class="hint-line" id="appPairHint">
+            局域网地址仅手机与电脑同一 Wi-Fi/网段时可用；没有远程地址说明 ngrok 隧道未启动，
+            出门时 App 将只能查看离线缓存。
+          </p>
+          <div class="form-actions">
+            <button type="button" id="appPairReloadBtn" class="btn-secondary">重新生成配对码</button>
+          </div>
+          <p class="privacy-note">
+            配对码里包含访问令牌（等同于待办读写权限），只复制给自己的手机；换手机或怀疑泄露时，
+            修改项目根目录 <code>.env</code> 的 <code>APP_TOKEN</code> 并重启服务，然后在 App 里重新配对。
+          </p>
+        </section>
+
+        <section class="card card--muted settings-section" id="sec-other">
+          <div class="card-head">
+            <h2><span class="card-kicker">06</span>其余配置</h2>
+          </div>
+          <p class="card-desc">
+            API 端口、App Token、批处理间隔等仍在项目根目录 <code>.env</code> 中配置，修改后重启服务生效。
+          </p>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div id="dirtyBar" class="save-bar" hidden role="region" aria-label="未保存修改">
+    <div class="save-bar__inner">
+      <span class="save-bar__dot" aria-hidden="true"></span>
+      <span class="save-bar__text">有未保存修改</span>
+      <span id="dirtySections" class="save-bar__sections" aria-live="polite"></span>
+      <span class="save-bar__spacer"></span>
+      <button type="button" id="dirtySaveBtn" class="btn-primary">保存</button>
+      <button type="button" id="dirtyDiscardBtn" class="btn-secondary">放弃</button>
+    </div>
+  </div>
+
+  <div id="authOverlay" class="auth-overlay" hidden>
+    <form id="authForm" class="auth-dialog">
+      <h2>输入访问令牌</h2>
+      <p>与任务表相同，来自 <code>.env</code> 的 <code>APP_TOKEN</code>。</p>
+      <input id="tokenInput" type="password" autocomplete="current-password" placeholder="APP_TOKEN">
+      <p id="authError" class="form-error" hidden></p>
+      <button type="submit" class="btn-primary">进入</button>
+    </form>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="./settings.js?v=20261029-1" defer></script>
+</body>
+</html>

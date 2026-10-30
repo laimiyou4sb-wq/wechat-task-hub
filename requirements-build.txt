@@ -1,0 +1,7 @@
+# 构建期依赖（PyInstaller onedir 打包用）
+# 运行期依赖由 requirements.txt 提供，构建环境必须先装齐，否则 PyInstaller
+# 静态分析会漏掉第三方模块（如 openai / brotli / tzdata）。
+-r requirements.txt
+
+# PyInstaller 6.x：onedir + windowed + version 资源；>=6.10 才完整支持 Python 3.13。
+pyinstaller>=6.10

@@ -1,0 +1,49 @@
+微信待办 WeChatTaskHub · 启动说明
+==================================
+
+一、第一次运行
+1. 把整个文件夹解压到固定位置（例如 D:\WeChatTaskHub）。
+   不要放在 C:\Program Files 等需要管理员权限的目录，否则 data\ 与 .env 写不进去。
+2. 双击 WeChatTaskHub.exe。
+   首次启动会自动生成 data\ 目录并自动打开浏览器；
+   如果目录里没有 .env，请把 .env.example 复制一份改名为 .env（按注释修改）。
+   没有自动打开浏览器时，手动访问 http://127.0.0.1:8765/
+3. 手机与电脑连同一个 Wi-Fi，浏览器打开
+   http://<电脑局域网 IP>:8765/?token=<.env 里的 APP_TOKEN>
+   启动器日志 data\launcher.log 里也会打印手机访问地址。
+
+二、配置
+- 用记事本打开 .env，按里面的注释修改（端口、访问令牌、数据源、推送等），改完重启程序。
+- 数据源默认需要 WeChatDataAnalysis 桌面端保持运行并已登录微信。
+- 不配置 LLM_API_KEY 时使用本地规则提取待办，不会联网。
+
+三、停止程序
+- 方式一：任务管理器结束 WeChatTaskHub.exe 进程树。
+- 方式二：在程序目录打开 PowerShell / CMD，执行：
+      WeChatTaskHub.exe --stop
+  停止会同时结束隧道守护进程。
+
+四、防火墙与手机访问
+- Windows 第一次启动可能弹出「Windows 安全中心」提示，
+  请勾选「专用网络」并允许访问；否则手机连不上。
+- 只在家庭/办公局域网使用：不要放行「公用网络」。
+- 手机能打开但提示无权限时，检查网址里的 token 与 .env 的 APP_TOKEN 一致。
+
+五、杀毒软件误报
+- 本程序未做代码签名，PyInstaller 打包的 exe 偶尔会被杀软（360/火绒等）
+  误报为可疑程序。请添加信任/白名单后重试，或改用源码运行。
+
+六、公网隧道（可选）
+- 需要远程访问时，在 .env 设置 TUNNEL_ENABLED=1 并按 README.md 配置 ngrok。
+  ngrok.exe 在 tools\ngrok\ 下，首次使用需运行 tools\ngrok_setup.ps1 写入 authtoken。
+- 隧道状态：data\tunnel.json；隧道日志：data\tunnel.log。
+
+七、升级
+- 新版本只需替换：WeChatTaskHub.exe、_internal\、web\、assets\、tools\
+- 千万不要删除或覆盖 data\ 和 .env（里面是待办数据库、日志和你的配置）。
+
+八、日志与排错
+- data\launcher.log                          启动器日志
+- data\service.out.log / service.err.log     服务日志
+- data\tunnel.log                            隧道日志
+- 打不开网页时，先看 data\launcher.log 最后的错误信息。
