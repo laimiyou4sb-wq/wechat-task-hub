@@ -71,6 +71,7 @@
 
 > 从零配置（WeChatDataAnalysis / DeepSeek / Bark / ntfy / 手机访问）的完整图文步骤见 **[docs/配置教程.md](docs/配置教程.md)**。
 > 手机同步用**自研安卓 App**（局域网直连 + ngrok 固定域名远程）：见 **[docs/手机同步.md](docs/手机同步.md)**。
+> **一键部署（交给 AI Agent）**：把 **[docs/一键部署-AGENT提示词.md](docs/一键部署-AGENT提示词.md)** 的整段提示词交给能执行 PowerShell 的 AI Agent，自动完成克隆/依赖/配置/启动/验收；需要人工的注册、扫码登录、装 App、UAC 提权等步骤已单列。
 
 ### 1. 环境
 
