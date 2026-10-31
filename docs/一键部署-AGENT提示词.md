@@ -9,7 +9,7 @@
 
 ## 0. 30 秒上手
 
-1. 准备一台 Windows 10/11 电脑，能上网。没装 Python/Git 也没关系：Agent 第 P0 步会检测并让你装（命令见 [M1](#m1-本机环境python--git只需一次)）。
+1. 准备一台 Windows 10/11 电脑，能上网。没装 Python/Git 也没关系：Agent 第 P0 步会检测并让你装（命令见 **M1**）。
 2. 打开一个**能执行命令**的 AI Agent（Claude Code、Codex、DeepSeek Harness、Cursor、Cline 等），把 [§1 的整段提示词](#1-提示词复制下面整段给-agent) 粘进去。
 3. 回答它的 5 个配置问题：数据源用 `demo` 还是 `wcda`、有没有 LLM Key、要不要外网（ngrok）、要不要推送、要不要桌面快捷方式。**不确定就说「用默认」**。
 4. 它说「【需要你操作】」时，对照 [§3](#3-需要人工辅助的步骤单列) 完成对应项，再回复它。
@@ -151,7 +151,7 @@ $t = 从 .env 读到的 APP_TOKEN（不打印明文）
    - 地址：本机 http://127.0.0.1:8765/?token=<掩码>；局域网 http://<IP>:8765/?token=<掩码>；远程 https://<域名>/（如有）
    - 数据源：demo / wcda + connected；LLM：已配置 / 规则模式；推送：Bark / ntfy / 未配置
    - 已改动文件：通常只有 .env（以及 ngrok 写出的 %LOCALAPPDATA%\ngrok\ngrok.yml）
-   - 仍需人工的事项：对照本文件 §3
+   - 仍需人工的事项：列出还等用户处理的项（注册账号 / 扫码登录 / 安装微信与 WeChatDataAnalysis / UAC 提权）
    - 日志：data\deploy.out.log、data\deploy.err.log、data\launcher.log、data\tunnel.log
    - 停止/卸载：python tools\tunnel.py --stop 停止隧道；结束 .venv\Scripts\python.exe 的 run.py 进程；删除安装目录即可（data\ 是本地数据，删前问用户是否备份）
 
@@ -193,12 +193,12 @@ $t = 从 .env 读到的 APP_TOKEN（不打印明文）
 
 | 你的目标 | 必须做的人工项 |
 |---|---|
-| 只在本机跑 demo（不读微信） | [M1](#m1-本机环境python--git只需一次)（仅当缺 Python/Git） |
-| 真实读取微信消息 | M1 + [M2](#m2-电脑版微信-4x) + [M3](#m3-wechatdataanalysiswcda) + [M4](#m4-llm-keydeepseek强烈建议)（LLM 可选但强烈建议） |
-| 手机同 Wi-Fi 访问网页 | 加 [M6](#m6-管理员放行防火墙-8765--开机自启可选) 管理员放行 8765（或用 ngrok 绕开） |
-| 手机在外网访问 | 加 [M5](#m5-ngrok注册-authtoken-免费固定域名远程访问) ngrok 注册 + authtoken |
-| 用自研安卓 App | 加 [M7](#m7-安卓-app安装-配对) 装 APK + 粘贴配对码 |
-| 发布/自动更新（可选） | 加 [M8](#m8-发布与自动更新可选仅发布者) |
+| 只在本机跑 demo（不读微信） | **M1**（仅当缺 Python/Git） |
+| 真实读取微信消息 | **M1** + **M2** + **M3** + **M4**（LLM 可选但强烈建议） |
+| 手机同 Wi-Fi 访问网页 | 加 **M6** 管理员放行 8765（或用 ngrok 绕开） |
+| 手机在外网访问 | 加 **M5** ngrok 注册 + authtoken |
+| 用自研安卓 App | 加 **M7** 装 APK + 粘贴配对码 |
+| 发布/自动更新（可选） | 加 **M8** |
 
 ### M1 本机环境：Python / Git（只需一次）
 
