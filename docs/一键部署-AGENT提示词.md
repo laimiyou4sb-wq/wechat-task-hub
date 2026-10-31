@@ -1,6 +1,6 @@
 # 一键部署 · 交给 AI Agent 的提示词（含人工辅助清单）
 
-> **适用版本**：仓库 `main`（v0.2.0，对应提交 `8539b0c`，2026-10）。
+> **适用版本**：仓库 `main`（v0.3.0 起，2026-10）。
 > **适用平台**：Windows 10/11 x64（本项目只支持 Windows；Python 3.10+，已在 3.13 验证）。
 > **思路**：把「环境检查 → 克隆代码 → 装依赖 → 生成配置 → 启动服务 → 验收 → 可选 ngrok 远程」交给一个**能执行 PowerShell 的 AI Agent**；
 > 需要你本人动手的注册、扫码登录、装软件、手机操作、UAC 提权，全部单列在 [§3](#3-需要人工辅助的步骤单列)，Agent 会在需要时停下来找你要。
@@ -37,7 +37,7 @@
 - 推送：<Bark URL / ntfy 主题 / 空 = 不推送>
 - 外网访问：否（默认）| 是（需要用户提供 ngrok authtoken）
 - 桌面快捷方式 / 开机自启：是（默认）
-- 项目：main 分支 v0.2.0，仅支持 Windows
+- 项目：main 分支 v0.3.0，仅支持 Windows
 
 ## 铁律
 1. 需要人工的步骤（账号注册、扫码登录、手机安装、UAC 提权）必须停下，用固定格式请求：
@@ -87,7 +87,7 @@ python -m venv .venv
 3) 按参数覆盖（保持其余行与注释不动）：
    - demo：DATA_SOURCE=demo、DEMO_MODE=1
    - wcda：DATA_SOURCE=wcda、DEMO_MODE=0、WCDA_BASE=http://127.0.0.1:10392
-   - LLM：LLM_API_KEY=<key>、LLM_BASE_URL=https://api.deepseek.com/v1、LLM_MODEL=deepseek-chat
+   - LLM：LLM_API_KEY=<key>、LLM_BASE_URL=https://api.deepseek.com/v1、LLM_MODEL=deepseek-chat、LLM_BATCH_MESSAGES=40（可选：同一轮内每批归并条数，默认 40；0=不分批）
    - 推送：PUSH_BARK_URL=<url> 或 NTFY_TOPIC=<topic>
    - 外网：TUNNEL_ENABLED=1（否则 0）
    # LLM_ENABLED 以 Key 非空为准；不填 Key 自动规则模式，不要删变量
@@ -119,10 +119,10 @@ wcda 模式：source.connected 首轮为 null 是正常的（启动 8 秒后的�
 
 ## P6 功能验收（必须真实请求，不能看日志猜）
 $t = 从 .env 读到的 APP_TOKEN（不打印明文）
-- 健康：Invoke-RestMethod http://127.0.0.1:8765/api/health → ok=true，version 与 app/version.py 一致（当前 0.2.0）
+- 健康：Invoke-RestMethod http://127.0.0.1:8765/api/health → ok=true，version 与 app/version.py 一致（当前 0.3.0）
 - 鉴权：Invoke-RestMethod http://127.0.0.1:8765/api/tasks -Headers @{ "X-Auth-Token" = $t } → 200（不是 401）
 - demo：Invoke-RestMethod -Method Post http://127.0.0.1:8765/api/demo/seed -Headers @{ "X-Auth-Token"=$t } → tasks_created>0；再查 /api/tasks 应有 3~4 条
-- wcda：等 source.connected=true；GET /api/collect/state 的 pending_messages 应趋于稳定、failed_messages=0（有失败可 POST /api/collect/failed/retry）
+- wcda：等 source.connected=true；GET /api/collect/state 的 pending_messages 应趋于稳定、failed_messages=0（有失败可 POST /api/collect/failed/retry）；collection.degraded 应为 false（降级原因见 degraded_reasons）
 - 推送（若配了）：Invoke-RestMethod -Method Post http://127.0.0.1:8765/api/push/test -Headers @{ "X-Auth-Token"=$t }，让用户确认手机收到「微信待办 · 测试」
 - 配对（App 场景）：Invoke-RestMethod http://127.0.0.1:8765/api/app/pairing -Headers @{ "X-Auth-Token"=$t } → 有 code 与 lan_urls
 - 页面：Invoke-WebRequest "http://127.0.0.1:8765/?token=$t" → 200 且返回 HTML
@@ -158,6 +158,7 @@ $t = 从 .env 读到的 APP_TOKEN（不打印明文）
 ## 常见故障速查（先自查再求助）
 - 页面 401 / token 不对：确认 .env 存在且 APP_TOKEN 不是默认值 wechat-tasks。
 - source.connected=false：WCDA 没运行 / 端口不对 / 微信没登录或没解密；source.last_error 含 No chat accounts found → 在 WCDA 界面选账号并解密一次。
+- 主页出现「采集降级」/ 失败队列 > 0：看 collection.degraded_reasons（llm_fallback 查 Key/网络；extraction_cap 调小 LLM_BATCH_MESSAGES；partial_failure/sessions_unavailable 下轮自动重试）；失败队列用 POST /api/collect/failed/retry 放回待处理。
 - 手机同 Wi-Fi 打不开：管理员放行防火墙 TCP 8765；公司/校园网 AP 隔离 → 只能走 ngrok。
 - data\tunnel.log 有 ERR_NGROK_105：authtoken 无效，重跑 ngrok_setup.ps1。
 - 端口 4040 被占：本机已有别的 ngrok 在跑，先关掉再启动隧道。
@@ -299,7 +300,7 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8765/api/demo/seed -Headers @{ "
 Invoke-RestMethod http://127.0.0.1:8765/api/tasks -Headers @{ "X-Auth-Token" = "<APP_TOKEN>" }
 ```
 
-- [ ] `/api/health` 返回 `ok: true`，`version` 与 `app/version.py` 一致（当前 0.2.0）
+- [ ] `/api/health` 返回 `ok: true`，`version` 与 `app/version.py` 一致（当前 0.3.0）
 - [ ] `/api/tasks` 不是 401，demo seed 后能看到 3~4 条任务
 - [ ] 浏览器打开 `http://127.0.0.1:8765/?token=<APP_TOKEN>` 显示任务表
 
@@ -307,6 +308,7 @@ Invoke-RestMethod http://127.0.0.1:8765/api/tasks -Headers @{ "X-Auth-Token" = "
 
 - [ ] `/api/health` 的 `source.connected = true`（首轮采集前为 `null` 属正常，8 秒后变 true）
 - [ ] `collection.pending_messages` 不再持续增长、`failed_messages = 0`
+- [ ] `collection.degraded = false`（出现降级按 §5 排查；`llm_fallback` 表示 LLM 调用失败已回退规则模式）
 - [ ] 实际发一条群消息，1~2 分钟内出现在任务表（或「已忽略/无待办」）
 
 ### 4.3 手机 / 外网（按需）
@@ -328,6 +330,7 @@ Invoke-RestMethod http://127.0.0.1:8765/api/tasks -Headers @{ "X-Auth-Token" = "
 | 手机同 Wi-Fi 打不开 | 管理员放行 TCP 8765；或公司/校园网 AP 隔离 → 改用 ngrok |
 | `data\tunnel.log` 有 `ERR_NGROK_105` | authtoken 无效/没配，重跑 `tools\ngrok_setup.ps1` |
 | 公网地址先出警告页 / `ERR_NGROK_6024` | ngrok 免费版正常现象，点 Visit；App/API 不受影响（可加 `ngrok-skip-browser-warning` 头） |
+| 主页出现「采集降级」/ 失败队列 > 0 | 看 `collection.degraded_reasons`：`llm_fallback` 查 Key/网络/额度（已回退规则模式，任务质量下降）；`extraction_cap` 调小 `LLM_BATCH_MESSAGES`（默认 40）；`partial_failure`/`sessions_unavailable` 为部分会话失败，下轮自动重试；失败队列用 `POST /api/collect/failed/retry` 或设置页「重试失败队列」 |
 | 8765 端口占用 | 改 `.env` 的 `PORT` 或关掉旧 `python.exe` |
 | ngrok 本地 4040 被占 | 本机已有别的 ngrok 在跑，先关掉 |
 | 页面像旧版 / 看不到 ⚙ | Service Worker 缓存：`Ctrl+Shift+R`；仍不行 DevTools → Application → Service Worker → Unregister |
