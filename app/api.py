@@ -77,6 +77,11 @@ class IdentityRefreshRequest(BaseModel):
     session_ids: list[str] | None = None
 
 
+class FailedRetryRequest(BaseModel):
+    rawids: list[str] | None = None   # None/空 = 按失败时间倒序重试一批
+    limit: int = 500
+
+
 def _clean_due(value: str | None) -> str | None:
     if value is None or str(value).strip() == "":
         return None
@@ -269,11 +274,38 @@ async def identity_judgments(request: Request) -> dict:
     return get_service(request).identity_judgments()
 
 
+@router.get("/collect/state")
+async def collection_state(request: Request) -> dict:
+    """采集水位与参数快照：每会话上次采到哪里、单轮上限、待处理条数、上次结果。"""
+    require_token(request)
+    return get_service(request).collection_state()
+
+
 @router.get("/catchup/state")
 async def catchup_state(request: Request) -> dict:
-    """补采水位与参数快照：每会话上次补到哪里、单轮上限、上次结果。"""
+    """兼容旧路径（deprecated）：等价于 GET /api/collect/state。"""
     require_token(request)
-    return get_service(request).catchup_state()
+    return get_service(request).collection_state()
+
+
+@router.get("/collect/failed")
+async def failed_queue(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    """失败队列：单条消息处理失败次数超过 MESSAGE_MAX_ATTEMPTS 后的快照。"""
+    require_token(request)
+    return get_service(request).failed_queue(limit=limit, offset=offset)
+
+
+@router.post("/collect/failed/retry")
+async def retry_failed(request: Request, payload: FailedRetryRequest | None = None) -> dict:
+    """把失败队列消息放回待处理（不传 rawids = 按失败时间倒序重试一批）。"""
+    require_token(request)
+    rawids = payload.rawids if payload is not None else None
+    limit = payload.limit if payload is not None else 500
+    return get_service(request).retry_failed(rawids, limit=limit)
 
 
 @router.post("/pinned/refresh")

@@ -117,17 +117,6 @@ def test_filter_settings_update(client):
     assert invalid.status_code == 422
 
 
-def test_only_new_message_filter(client):
-    service = client.app.state.service
-    old = int(time.time()) - 3600
-    now = int(time.time())
-    assert service._is_new_message({"ts": old}) is False
-    assert service._is_new_message({"ts": now}) is True
-    service.settings.only_new_messages = False
-    assert service._is_new_message({"ts": old}) is True
-    service.settings.only_new_messages = True
-
-
 def test_whitelist_modes(client):
     service = client.app.state.service
     service.pinned_ready = True

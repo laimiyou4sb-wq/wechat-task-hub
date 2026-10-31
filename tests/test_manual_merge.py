@@ -22,10 +22,8 @@ def _settings(tmp_path) -> Settings:
         llm_base_url="http://127.0.0.1:9/v1",
         whitelist_mode="all",
         include_private=True,
-        only_new_messages=False,
         quiet_start="00:00",
         quiet_end="00:00",
-        batch_seconds=0,
     )
 
 
@@ -75,7 +73,8 @@ def test_same_relation_supplements_manual_task_without_duplicate(tmp_path, monke
     manual = _manual(service, "科创破冰", due="2026-11-01T18:00:00")
     seen = []
 
-    async def fake_match(candidates, manual_tasks, messages, settings, now=None):
+    async def fake_match(candidates, manual_tasks, messages, settings, now=None,
+                         ignored_tasks=None):
         seen.append((len(candidates), [task["id"] for task in manual_tasks]))
         return [ManualDecision(
             index=0, relation="same", manual_task_id=manual["id"],
@@ -109,7 +108,8 @@ def test_same_relation_fills_blank_due_when_manual_left_it_empty(tmp_path, monke
     service = AppService(_settings(tmp_path))
     manual = _manual(service, "科创破冰")
 
-    async def fake_match(candidates, manual_tasks, messages, settings, now=None):
+    async def fake_match(candidates, manual_tasks, messages, settings, now=None,
+                         ignored_tasks=None):
         return [ManualDecision(
             index=0, relation="same", manual_task_id=manual["id"],
             supplement_notes="11月1日下午2点，桑浦山校区",
@@ -135,7 +135,8 @@ def test_partial_overlap_splits_into_supplement_plus_new_task(tmp_path, monkeypa
     service = AppService(_settings(tmp_path))
     manual = _manual(service, "科创破冰", due="2026-11-01T18:00:00")
 
-    async def fake_match(candidates, manual_tasks, messages, settings, now=None):
+    async def fake_match(candidates, manual_tasks, messages, settings, now=None,
+                         ignored_tasks=None):
         return [ManualDecision(
             index=0, relation="split", manual_task_id=manual["id"],
             supplement_notes="11月1日下午2点，地点待定",
@@ -174,7 +175,8 @@ def test_unrelated_decision_creates_task_as_before(tmp_path, monkeypatch):
     service = AppService(_settings(tmp_path))
     manual = _manual(service, "交论文")
 
-    async def fake_match(candidates, manual_tasks, messages, settings, now=None):
+    async def fake_match(candidates, manual_tasks, messages, settings, now=None,
+                         ignored_tasks=None):
         return [ManualDecision(index=0, relation="none")]
 
     monkeypatch.setattr(service_module, "llm_reconcile",
@@ -196,7 +198,8 @@ def test_match_failure_falls_back_to_plain_creation(tmp_path, monkeypatch):
     service = AppService(_settings(tmp_path))
     _manual(service, "科创破冰")
 
-    async def fake_match(candidates, manual_tasks, messages, settings, now=None):
+    async def fake_match(candidates, manual_tasks, messages, settings, now=None,
+                         ignored_tasks=None):
         return None
 
     monkeypatch.setattr(service_module, "llm_reconcile",

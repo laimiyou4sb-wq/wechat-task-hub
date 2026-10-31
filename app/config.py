@@ -121,45 +121,41 @@ class Settings:
     db_path: Path = DEFAULT_DATA_DIR / "app.db"
     env_file: Path = DEFAULT_ENV_FILE
 
-    data_source: str = "weflow"
+    data_source: str = "wcda"
     wcda_base: str = "http://127.0.0.1:10392"
-    wcda_interval_ms: int = 2000
     wcda_account: str = ""
-    wcda_include_sent: bool = False
-    # 调试/回放：只订阅某个会话，并从指定 localId 之后回放（联调用，默认关闭）
-    wcda_replay_username: str = ""
-    wcda_replay_since_id: int = 0
-    wcda_allow_replay: bool = False
 
-    # 只处理服务启动后新收到的消息（不回溯历史）
-    only_new_messages: bool = True
-
-    # wcda 补采兜底：实时 SSE 偶尔会漏消息，按会话列表/最新消息定期补齐
-    wcda_catchup_seconds: int = 120          # 0 = 关闭
-    wcda_catchup_lookback_minutes: int = 30  # 每轮至少回看的窗口（兜实时流漏消息）
+    # wcda 采集（唯一采集方法）：localId 增量游标 + 按会话水位轮询 REST 接口
+    wcda_catchup_seconds: int = 120          # 0 = 关闭周期采集（仅启动时采一轮）
+    wcda_catchup_lookback_minutes: int = 30  # 每轮至少回看：覆盖两轮之间的新消息
     wcda_catchup_on_start_minutes: int = 0   # 启动时按固定窗口回补（0 = 用会话水位补）
     wcda_catchup_limit: int = 300            # 旧版单次拉取条数（兼容回退路径）
-    # 补采增强：按会话水位 + 分页读取，覆盖长时间离线期间漏采的消息
+    # 采集增强：localId 游标 + 分页读取，覆盖长时间离线期间漏采的消息；
+    # 每轮拿到消息后按会话一次处理，不再按条数切批。
     wcda_catchup_max_hours: int = 168        # 单会话单轮最长回看（默认 7 天）
     wcda_catchup_page_size: int = 500        # 分页每页条数（WCDA 支持 offset/order）
     wcda_catchup_max_messages: int = 50000   # 单会话单轮最多拉取条数（防接口异常失控）
     wcda_catchup_round_budget: int = 2000    # 每轮最多处理条数（0 = 不限制），超出留到下一轮
-    wcda_catchup_overlap_seconds: int = 300  # 水位重叠回看，容忍写入延迟/时钟误差
-    wcda_catchup_batch_messages: int = 80    # 每批归纳条数（沿用事件账本的批次粒度）
+    wcda_catchup_overlap_seconds: int = 300  # 时间水位重叠回看，容忍写入延迟/时钟误差
     # 无水位且服务启动前没有该会话任何历史消息时，自动回看的窗口（小时）
     wcda_catchup_empty_history_hours: int = 24
-    # 新置顶的聊天纳入监控时，自动回补最近 N 分钟（0 = 不回补，只从下一轮实时流开始）
+    # 新置顶的聊天纳入监控时，自动回补最近 N 分钟（0 = 不回补，等下一轮采集）
     wcda_new_pin_backfill_minutes: int = 120
+    # localId 游标解决「正常新消息」的增量；WCDA 分页按 createTime 排序，所以
+    # 「写入晚、业务时间旧」的晚到消息可能落在游标扫描深度之外，再用周期深扫兜底：
+    # 每 N 分钟按时间窗重扫一次（0=关闭），窗口默认回看 24 小时。
+    wcda_deep_scan_minutes: int = 60
+    wcda_deep_scan_lookback_minutes: int = 1440
+    # 单条消息处理失败的最大重试次数；超过后进「失败队列」并告警，
+    # 不再阻塞同一会话后续消息（设置页可一键重试失败队列）
+    message_max_attempts: int = 3
 
-    weflow_base: str = "http://127.0.0.1:5031"
-    weflow_token: str = ""
     group_whitelist: list[str] = field(default_factory=list)
     # all | pinned | custom | pinned_custom
     whitelist_mode: str = "all"
     whitelist_mode_valid = ("all", "pinned", "custom", "pinned_custom")
     pinned_refresh_seconds: int = 60
     include_private: bool = False
-    catchup_minutes: int = 720
 
     me_names: list[str] = field(default_factory=list)
 
@@ -169,14 +165,8 @@ class Settings:
     identity_fuzzy: bool = True
     identity_ttl_seconds: int = 600
 
-    batch_seconds: int = 300
-    batch_max_messages: int = 80
-
-    # 事件账本：按会话微批次 + 静默封口
-    event_idle_seconds: int = 20
-    event_max_wait_seconds: int = 300
-    event_max_messages: int = 30
-    event_max_chars: int = 6000
+    # 手动待办「已忽略去重」：忽略后多少天内，同类消息不再重复新建待办（0=关闭）
+    manual_suppress_days: int = 30
 
     llm_enabled: bool = False
     llm_base_url: str = "https://api.deepseek.com/v1"
@@ -210,6 +200,10 @@ class Settings:
         if not env_file.is_absolute():
             env_file = APP_DIR / env_file
         llm_key = _get("LLM_API_KEY")
+        data_source = (_get("DATA_SOURCE", "wcda").lower() or "wcda")
+        if data_source not in ("wcda", "demo"):
+            # 旧配置里的 weflow 数据源已被移除：退回唯一数据源 wcda，避免服务无源可用
+            data_source = "wcda"
         return cls(
             host=_get("HOST", "0.0.0.0"),
             port=_int("PORT", 8765),
@@ -218,15 +212,9 @@ class Settings:
             data_dir=data_dir,
             db_path=db_path,
             env_file=env_file,
-            data_source=_get("DATA_SOURCE", "weflow").lower() or "weflow",
+            data_source=data_source,
             wcda_base=_get("WCDA_BASE", "http://127.0.0.1:10392").rstrip("/"),
-            wcda_interval_ms=_int("WCDA_INTERVAL_MS", 500),
             wcda_account=_get("WCDA_ACCOUNT"),
-            wcda_include_sent=_bool("WCDA_INCLUDE_SENT", False),
-            wcda_replay_username=_get("WCDA_REPLAY_USERNAME"),
-            wcda_replay_since_id=_int("WCDA_REPLAY_SINCE_LOCAL_ID", 0),
-            wcda_allow_replay=_bool("WCDA_ALLOW_REPLAY", False),
-            only_new_messages=_bool("ONLY_NEW_MESSAGES", True),
             wcda_catchup_seconds=max(0, _int("WCDA_CATCHUP_SECONDS", 120)),
             wcda_catchup_lookback_minutes=max(1, _int("WCDA_CATCHUP_LOOKBACK_MINUTES", 30)),
             wcda_catchup_on_start_minutes=max(0, _int("WCDA_BACKFILL_MINUTES", 0)),
@@ -236,28 +224,22 @@ class Settings:
             wcda_catchup_max_messages=max(1000, _int("WCDA_CATCHUP_MAX_MESSAGES", 50000)),
             wcda_catchup_round_budget=max(0, _int("WCDA_CATCHUP_ROUND_BUDGET", 2000)),
             wcda_catchup_overlap_seconds=max(0, _int("WCDA_CATCHUP_OVERLAP_SECONDS", 300)),
-            wcda_catchup_batch_messages=max(5, min(_int("WCDA_CATCHUP_BATCH_MESSAGES", 80), 500)),
             wcda_catchup_empty_history_hours=max(1, _int("WCDA_CATCHUP_EMPTY_HISTORY_HOURS", 24)),
-            weflow_base=_get("WEFLOW_BASE", "http://127.0.0.1:5031").rstrip("/"),
-            weflow_token=_get("WEFLOW_TOKEN"),
-            group_whitelist=_list("GROUP_WHITELIST") or _list("WEFLOW_GROUPS"),
+            message_max_attempts=max(1, _int("MESSAGE_MAX_ATTEMPTS", 3)),
+            group_whitelist=_list("GROUP_WHITELIST"),
             whitelist_mode=(_get("WHITELIST_MODE", "all").lower()
                             if _get("WHITELIST_MODE", "all").lower() in cls.whitelist_mode_valid else "all"),
             pinned_refresh_seconds=max(30, _int("PINNED_REFRESH_SECONDS", 60)),
             wcda_new_pin_backfill_minutes=max(0, _int("WCDA_NEW_PIN_BACKFILL_MINUTES", 120)),
-            include_private=_bool("INCLUDE_PRIVATE", _bool("WEFLOW_INCLUDE_PRIVATE", False)),
-            catchup_minutes=_int("WEFLOW_CATCHUP_MINUTES", 720),
+            wcda_deep_scan_minutes=max(0, _int("WCDA_DEEP_SCAN_MINUTES", 60)),
+            wcda_deep_scan_lookback_minutes=max(30, _int("WCDA_DEEP_SCAN_LOOKBACK_MINUTES", 1440)),
+            include_private=_bool("INCLUDE_PRIVATE", False),
             me_names=_list("ME_NAMES"),
             me_wxid=_get("ME_WXID"),
             identity_filter=_bool("IDENTITY_FILTER", True),
             identity_fuzzy=_bool("IDENTITY_FUZZY", True),
             identity_ttl_seconds=max(60, _int("IDENTITY_TTL_SECONDS", 600)),
-            batch_seconds=max(0, _int("BATCH_SECONDS", 300)),
-            batch_max_messages=max(1, _int("BATCH_MAX_MESSAGES", 80)),
-            event_idle_seconds=max(5, _int("EVENT_IDLE_SECONDS", 20)),
-            event_max_wait_seconds=max(30, _int("EVENT_MAX_WAIT_SECONDS", 300)),
-            event_max_messages=max(5, _int("EVENT_MAX_MESSAGES", 30)),
-            event_max_chars=max(500, _int("EVENT_MAX_CHARS", 6000)),
+            manual_suppress_days=max(0, _int("MANUAL_SUPPRESS_DAYS", 30)),
             llm_enabled=_bool("LLM_ENABLED", bool(llm_key)) and bool(llm_key),
             llm_base_url=_get("LLM_BASE_URL", "https://api.deepseek.com/v1").rstrip("/"),
             llm_api_key=llm_key,
@@ -274,10 +256,6 @@ class Settings:
             demo_mode=_bool("DEMO_MODE", False),
             retention_days=_int("RETENTION_DAYS", 30),
         )
-
-    @property
-    def weflow_configured(self) -> bool:
-        return bool(self.weflow_token)
 
     @property
     def base_url(self) -> str:

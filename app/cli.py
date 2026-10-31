@@ -34,7 +34,7 @@ def _ensure_stdio() -> None:
 def _print_banner(settings, lan_ip: str) -> None:
     source_label = {
         "wcda": f"WeChatDataAnalysis（{settings.wcda_base}）",
-        "weflow": f"WeFlow（{settings.weflow_base}）",
+        "demo": "演示（不连接数据源）",
     }.get(settings.data_source, settings.data_source)
     print("=" * 62)
     print("  微信待办  WeChat Task Hub")
@@ -45,8 +45,6 @@ def _print_banner(settings, lan_ip: str) -> None:
         print("  演示模式 : 已开启（可用 POST /api/demo/seed 生成示例待办）")
     if settings.data_source == "wcda":
         print("  提示     : 请保持 WeChatDataAnalysis 桌面端运行，并已登录微信")
-    elif settings.data_source == "weflow" and not settings.weflow_configured:
-        print("  提示     : 未配置 WEFLOW_TOKEN，暂时收不到微信消息")
     if not settings.llm_api_key:
         print("  提示     : 未配置 LLM_API_KEY，使用本地规则提取待办")
     if not (settings.bark_url or settings.ntfy_topic):
@@ -68,7 +66,6 @@ def run_server(argv: list[str] | None = None) -> None:
 
     if args.demo:
         os.environ["DEMO_MODE"] = "1"
-        os.environ.setdefault("BATCH_SECONDS", "0")
     if args.host:
         os.environ["HOST"] = args.host
     if args.port:

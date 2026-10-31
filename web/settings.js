@@ -773,12 +773,11 @@
 
   const CATCHUP_MODE_LABELS = {
     watermark: '按会话水位',
-    window: '固定窗口',
     off: '已关闭',
   };
 
   let statusBusy = false;
-  const STATUS_BUTTONS = ['#pinnedRefreshBtn', '#statusRefreshBtn'];
+  const STATUS_BUTTONS = ['#pinnedRefreshBtn', '#statusRefreshBtn', '#retryFailedBtn'];
 
   function statusNumber(value) {
     const number = Number(value);
@@ -838,18 +837,27 @@
   function renderStatus(data) {
     const health = data && typeof data === 'object' ? data : {};
     const source = health.source && typeof health.source === 'object' ? health.source : {};
-    const catchup = health.catchup && typeof health.catchup === 'object' ? health.catchup : {};
+    const collection = health.collection && typeof health.collection === 'object'
+      ? health.collection
+      : (health.catchup && typeof health.catchup === 'object' ? health.catchup : {});
     const whitelist = health.whitelist && typeof health.whitelist === 'object' ? health.whitelist : {};
     const events = health.events && typeof health.events === 'object' ? health.events : {};
     const llm = health.llm && typeof health.llm === 'object' ? health.llm : {};
     const tasks = health.tasks && typeof health.tasks === 'object' ? health.tasks : {};
 
-    const connected = source.connected === true;
-    const configured = source.configured !== false;
+    const connected = source.connected;
     const pill = $('#statusPill');
     if (pill) {
-      pill.className = 'status-pill ' + (connected ? 'status-pill--ok' : 'status-pill--off');
-      pill.textContent = connected ? '正常' : '未连接';
+      if (connected === true) {
+        pill.className = 'status-pill status-pill--ok';
+        pill.textContent = '正常';
+      } else if (connected === false) {
+        pill.className = 'status-pill status-pill--off';
+        pill.textContent = '未连接';
+      } else {
+        pill.className = 'status-pill status-pill--muted';
+        pill.textContent = '等待首轮采集';
+      }
     }
     const errorBox = $('#statusError');
     if (errorBox) errorBox.hidden = true;
@@ -857,10 +865,10 @@
     if (body) body.hidden = false;
 
     statusSet('#statusSourceType', health.data_source || source.type || '—');
-    statusSet('#statusSourceConnected', connected ? '已连接' : configured ? '未连接' : '未配置');
-    statusSet('#statusStreams', source.streams === null || source.streams === undefined
-      ? '—'
-      : `${statusNumber(source.streams)} 路`);
+    statusSet('#statusSourceConnected', connected === true
+      ? '已连接'
+      : connected === false ? '未连接' : '等待中');
+    statusSet('#statusLastCollect', statusTime(source.last_collect_at));
     statusSet('#statusLastEvent', statusTime(source.last_event_at));
 
     const sourceErrorEl = $('#statusSourceError');
@@ -870,54 +878,80 @@
       sourceErrorEl.textContent = lastError ? `最近错误：${lastError}` : '';
     }
 
-    const catchupEnabled = catchup.enabled === true && catchup.mode !== 'off';
-    statusSet('#statusCatchupHint', catchupEnabled ? '全自动' : '未启用');
-    statusSet('#statusCatchupMode', CATCHUP_MODE_LABELS[catchup.mode]
-      || (catchup.mode ? String(catchup.mode) : '—'));
-    const catchupSeconds = Number(catchup.seconds);
-    statusSet('#statusCatchupInterval', !Number.isFinite(catchupSeconds) || catchupSeconds <= 0
+    const collectionEnabled = collection.enabled === true && collection.mode !== 'off';
+    statusSet('#statusCatchupHint', collectionEnabled ? '全自动' : '仅启动时');
+    statusSet('#statusCatchupMode', CATCHUP_MODE_LABELS[collection.mode]
+      || (collection.mode ? String(collection.mode) : '—'));
+    const collectionSeconds = Number(collection.seconds);
+    statusSet('#statusCatchupInterval', !Number.isFinite(collectionSeconds) || collectionSeconds <= 0
       ? '仅启动时'
-      : formatInterval(catchupSeconds));
-    statusSet('#statusCatchupLookback', statusMinutes(catchup.lookback_minutes));
-    statusSet('#statusCatchupMax', catchup.max_hours === null || catchup.max_hours === undefined
+      : formatInterval(collectionSeconds));
+    statusSet('#statusCatchupLookback', statusMinutes(collection.lookback_minutes));
+    statusSet('#statusCatchupMax', collection.max_hours === null || collection.max_hours === undefined
       ? '—'
-      : statusMinutes(Number(catchup.max_hours) * 60));
+      : statusMinutes(Number(collection.max_hours) * 60));
     statusSet('#statusCatchupEmpty',
-      catchup.empty_history_hours === null || catchup.empty_history_hours === undefined
+      collection.empty_history_hours === null || collection.empty_history_hours === undefined
         ? '—'
-        : statusMinutes(Number(catchup.empty_history_hours) * 60));
-    statusSet('#statusCatchupPageSize', catchup.page_size === null || catchup.page_size === undefined
+        : statusMinutes(Number(collection.empty_history_hours) * 60));
+    statusSet('#statusCatchupPageSize', collection.page_size === null || collection.page_size === undefined
       ? '—'
-      : `${statusNumber(catchup.page_size)} 条/页`);
-    const catchupBudget = Number(catchup.round_budget);
-    statusSet('#statusCatchupBudget', !Number.isFinite(catchupBudget) || catchupBudget <= 0
+      : `${statusNumber(collection.page_size)} 条/页`);
+    const collectionBudget = Number(collection.round_budget);
+    statusSet('#statusCatchupBudget', !Number.isFinite(collectionBudget) || collectionBudget <= 0
       ? '不限制'
-      : `${statusNumber(catchupBudget)} 条/轮`);
-    const catchupBackfill = Number(catchup.backfill_minutes);
-    statusSet('#statusCatchupBackfill', Number.isFinite(catchupBackfill) && catchupBackfill > 0
-      ? statusMinutes(catchupBackfill)
+      : `${statusNumber(collectionBudget)} 条/轮`);
+    const collectionBackfill = Number(collection.backfill_minutes);
+    statusSet('#statusCatchupBackfill', Number.isFinite(collectionBackfill) && collectionBackfill > 0
+      ? statusMinutes(collectionBackfill)
       : '不额外回补');
+    const deepScanMinutes = Number(collection.deep_scan_minutes);
+    const deepScanLookback = Number(collection.deep_scan_lookback_minutes);
+    statusSet('#statusDeepScan', !Number.isFinite(deepScanMinutes) || deepScanMinutes <= 0
+      ? '关闭'
+      : `每 ${statusMinutes(deepScanMinutes)} · 回看 ${statusMinutes(deepScanLookback)}`);
     statusSet('#statusCatchupWatermarks',
-      catchup.watermarks === null || catchup.watermarks === undefined
+      collection.watermarks === null || collection.watermarks === undefined
         ? '—'
-        : `${statusNumber(catchup.watermarks)} 个`);
+        : `${statusNumber(collection.watermarks)} 个`);
+    const cursorSessions = collection.cursor_sessions;
+    statusSet('#statusCursorSessions',
+      cursorSessions === null || cursorSessions === undefined
+        ? '—'
+        : `${statusNumber(cursorSessions)} 个`);
+    statusSet('#statusCollectPendingMessages', statusNumber(collection.pending_messages));
+    statusSet('#statusCollectPendingSessions', statusNumber(collection.pending_sessions));
+    statusSet('#statusMaxAttempts', collection.max_attempts === null
+      || collection.max_attempts === undefined
+      ? '—'
+      : `${statusNumber(collection.max_attempts)} 次`);
+    const failedMessages = collection.failed_messages;
+    statusSet('#statusFailedMessages', failedMessages === null || failedMessages === undefined
+      ? '—'
+      : `${statusNumber(failedMessages)} 条`);
+    statusSet('#statusFailedSessions', collection.failed_sessions === null
+      || collection.failed_sessions === undefined
+      ? '—'
+      : `${statusNumber(collection.failed_sessions)} 个`);
 
-    const catchupLastEl = $('#statusCatchupLast');
-    if (catchupLastEl) {
-      const last = catchup.last && typeof catchup.last === 'object' ? catchup.last : null;
+    const collectionLastEl = $('#statusCatchupLast');
+    if (collectionLastEl) {
+      const last = collection.last && typeof collection.last === 'object' ? collection.last : null;
       if (!last) {
-        catchupLastEl.textContent = '上次补采：尚未执行';
+        collectionLastEl.textContent = '上次采集：尚未执行';
       } else if (last.ok === false) {
-        catchupLastEl.textContent = `上次补采失败：${last.reason || last.error || '未知原因'}`;
+        collectionLastEl.textContent = `上次采集失败：${last.reason || last.error || '未知原因'}`;
       } else {
-        const modeLabel = last.mode === 'watermark'
-          ? '水位补全'
-          : statusMinutes(last.minutes) !== '—' ? `回看 ${statusMinutes(last.minutes)}` : '补采';
+        const modeLabel = last.deep_scan
+          ? '晚到消息深扫'
+          : last.mode === 'watermark' ? '按 localId 游标'
+            : statusMinutes(last.minutes) !== '—' ? `回看 ${statusMinutes(last.minutes)}` : '采集';
         const parts = [
           modeLabel,
           `会话 ${statusNumber(last.sessions)}`,
           `扫描 ${statusNumber(last.scanned)}`,
           `新增消息 ${statusNumber(last.inserted)}`,
+          `处理 ${statusNumber(last.processed)}`,
           `新建待办 ${statusNumber(last.tasks_created)}`,
           `更新待办 ${statusNumber(last.tasks_updated)}`,
         ];
@@ -925,9 +959,11 @@
           parts.push(`分页 ${statusNumber(last.pages)}`);
         }
         if (last.budget_exhausted) parts.push('本轮预算用完，余量下轮继续');
+        if (last.dead_lettered) parts.push(`失败入队 ${statusNumber(last.dead_lettered)} 条`);
+        if (last.failed_queue) parts.push(`失败队列 ${statusNumber(last.failed_queue)} 条`);
         const skipped = Array.isArray(last.skipped) ? last.skipped.length : 0;
         if (skipped > 0) parts.push(`跳过 ${skipped} 个会话`);
-        catchupLastEl.textContent = `上次补采：成功 · ${parts.join(' · ')} · ${statusTime(last.at)}`;
+        collectionLastEl.textContent = `上次采集：成功 · ${parts.join(' · ')} · ${statusTime(last.at)}`;
       }
     }
 
@@ -944,16 +980,13 @@
       : '');
 
     statusSet('#statusEventsOpen', statusNumber(events.open));
-    statusSet('#statusBufferedSessions', statusNumber(events.buffered_sessions));
-    statusSet('#statusBufferedMessages', statusNumber(events.buffered_messages));
+    statusSet('#statusBufferedSessions', statusNumber(events.pending_sessions));
+    statusSet('#statusBufferedMessages', statusNumber(events.pending_messages));
 
     statusSet('#statusLlm', llm.configured === true ? '已配置' : llm.configured === false ? '未配置' : '—');
     statusSet('#statusTasksPending', tasks.pending === null || tasks.pending === undefined
       ? '—'
       : `${statusNumber(tasks.pending)} 条`);
-    statusSet('#statusOnlyNew', health.only_new_messages === true
-      ? '是'
-      : health.only_new_messages === false ? '否' : '—');
     statusSet('#statusVersion', health.version ? `v${health.version}` : '');
   }
 
@@ -1040,6 +1073,44 @@
     try {
       const loaded = await loadStatus();
       toast(loaded ? '运行状态已刷新' : '读取运行状态失败');
+    } finally {
+      setStatusBusy(false, button);
+    }
+  }
+
+  async function retryFailedQueue() {
+    if (statusBusy) return;
+    const box = $('#retryFailedResult');
+    const button = $('#retryFailedBtn');
+    if (box) {
+      box.hidden = false;
+      box.className = 'test-result';
+      box.textContent = '正在把失败队列放回待处理…';
+    }
+    setStatusBusy(true, button, '重试中…');
+    try {
+      const result = await api('/api/collect/failed/retry', { method: 'POST' });
+      const requeued = statusNumber(result && result.requeued);
+      const remaining = statusNumber(result && result.remaining);
+      const detail = `已放回 ${requeued} 条，失败队列剩余 ${remaining} 条`;
+      if (box) {
+        box.className = 'test-result ok';
+        box.textContent = `重试已安排：${detail}（下一轮采集会自动处理）`;
+      }
+      toast(`失败队列：${detail}`);
+      await loadStatus();
+    } catch (error) {
+      if (error.message !== 'unauthorized') {
+        if (box) {
+          box.className = 'test-result err';
+          box.textContent = error.status === 404
+            ? '失败队列接口不存在（404）：当前服务还是旧版本，更新并重启后再试。'
+            : `重试失败队列失败：${error.message}`;
+        }
+        toast('重试失败队列失败');
+      } else if (box) {
+        box.hidden = true;
+      }
     } finally {
       setStatusBusy(false, button);
     }
@@ -1256,6 +1327,7 @@
     });
     $('#pinnedRefreshBtn').addEventListener('click', refreshPinned);
     $('#statusRefreshBtn').addEventListener('click', refreshStatus);
+    $('#retryFailedBtn').addEventListener('click', retryFailedQueue);
     $('#statusRetryBtn').addEventListener('click', () => { void loadStatus(); });
     $('#appCopyCode').addEventListener('click', () => copyText($('#appPairCode').value));
     $('#appPairReloadBtn').addEventListener('click', () => { void loadAppPairing(); });

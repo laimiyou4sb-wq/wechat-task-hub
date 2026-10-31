@@ -1,4 +1,4 @@
-"""wcda 补采兜底单测：补 SSE 漏消息 + 指定会话回补历史 + 去重。"""
+"""wcda 采集单测：补 SSE 漏消息 + 指定会话回补历史 + 去重。"""
 import asyncio
 import time
 
@@ -31,7 +31,6 @@ def _settings(tmp_path, **overrides) -> Settings:
         app_token="test",
         whitelist_mode="pinned",
         include_private=True,
-        only_new_messages=True,
         llm_enabled=False,
         quiet_start="00:00",
         quiet_end="00:00",
@@ -84,7 +83,7 @@ def test_catchup_ingests_missed_messages_and_dedupes(tmp_path):
     assert stats["sessions"] == 1
     assert stats["tasks_created"] >= 1
     assert "room@chatroom" in fake.fetched
-    assert service.db.list_tasks("pending"), "补采后的可执行消息应生成待办"
+    assert service.db.list_tasks("pending"), "采集后的可执行消息应生成待办"
 
     again = asyncio.run(service.catchup(minutes=180))
     assert again["inserted"] == 0, "同一批消息不应重复入库/重复建待办"
@@ -195,42 +194,4 @@ def test_monitored_sessions_follow_pin_changes(tmp_path):
     fake._sessions = [{"username": "a@chatroom", "name": "A群", "isGroup": True, "isTop": False}]
     targets = asyncio.run(service._monitored_sessions())
     assert {item["session_id"] for item in targets} == set()
-    service.db.close()
-
-
-def test_handle_stream_message_ingests_and_buffers(tmp_path):
-    """单会话实时流收到消息：去重入库 + 进缓冲（后续由 event_loop 处理）。"""
-    service = AppService(_settings(tmp_path, whitelist_mode="all"))
-    message = {
-        "rawid": "stream-1", "session_id": "room@chatroom", "group_name": "项目群",
-        "sender": "张三", "content": "周五前填写破冰人数统计表", "ts": int(time.time()),
-        "is_group": True, "event": "message.new",
-        "at_usernames": [], "at_names": [], "quote_username": "",
-    }
-    service._handle_stream_message(message)
-    assert len(service.db.messages_by_ids(["stream-1"])) == 1
-    assert len(service.session_buffers.get("room@chatroom", [])) == 1
-
-    # 重复收到同一条：不重复入库、不重复缓冲
-    service._handle_stream_message(dict(message))
-    assert len(service.db.messages_by_ids(["stream-1"])) == 1
-    assert len(service.session_buffers.get("room@chatroom", [])) == 1
-
-    assert service.connected is True
-    service.db.close()
-
-
-def test_handle_stream_message_respects_whitelist(tmp_path):
-    sessions = [{"username": "a@chatroom", "name": "A群", "isGroup": True, "isTop": True}]
-    service = AppService(_settings(tmp_path, whitelist_mode="pinned"))
-    service.wcda = FakeWcda(sessions, {})
-    asyncio.run(service.refresh_pinned())
-    message = {
-        "rawid": "stream-2", "session_id": "other@chatroom", "group_name": "未监控群",
-        "sender": "李四", "content": "明天交表", "ts": int(time.time()),
-        "is_group": True, "event": "message.new", "at_usernames": [],
-        "at_names": [], "quote_username": "",
-    }
-    service._handle_stream_message(message)
-    assert service.db.messages_by_ids(["stream-2"]) == []
     service.db.close()

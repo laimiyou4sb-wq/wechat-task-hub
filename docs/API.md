@@ -92,23 +92,46 @@ Body（字段都可选）：
 {
   "ok": true,
   "data_source": "wcda",
-  "source": {"type": "wcda", "configured": true, "connected": true, "last_event_at": "2026-10-23T23:09:41",
-             "stream_mode": "per-session", "streams": 14},
-  "wcda": {"configured": true, "base": "http://127.0.0.1:10392", "connected": true},
-  "weflow": {"configured": false, "connected": false, "last_event_at": null},
+  "source": {"type": "wcda", "configured": true, "connected": true,
+             "last_event_at": "2026-10-31T01:03:12", "last_error": null,
+             "last_collect_at": "2026-10-31T01:05:00"},
+  "wcda": {"configured": true, "base": "http://127.0.0.1:10392",
+           "connected": true, "last_error": null},
   "llm": {"configured": true},
   "push": {"bark": true, "ntfy": false},
+  "filters": {"group_whitelist": [], "include_private": false},
   "whitelist": {"mode": "pinned", "custom_count": 0, "pinned_count": 13, "pinned_ready": true},
+  "events": {"open": 5, "pending_sessions": 2, "pending_messages": 3,
+             "failed_sessions": 0, "failed_messages": 0},
   "identity": {"account": "wxid_xxx", "account_source": "auto", "filter_enabled": true,
                "fuzzy_enabled": true, "groups_cached": 13,
                "judgments": {"kept_me": 3, "kept_all": 1, "kept_none": 12,
                              "dropped_other": 5, "since": "2026-10-26T08:30:00"}},
-  "only_new_messages": true,
+  "collection": {"enabled": true, "mode": "watermark", "seconds": 120,
+                 "lookback_minutes": 30, "backfill_minutes": 0, "max_hours": 168,
+                 "page_size": 500, "round_budget": 2000, "empty_history_hours": 24,
+                 "overlap_seconds": 300, "deep_scan_minutes": 60,
+                 "deep_scan_lookback_minutes": 1440, "max_attempts": 3,
+                 "watermarks": 14, "cursor_sessions": 14,
+                 "pending_messages": 3, "pending_sessions": 2,
+                 "failed_messages": 0, "failed_sessions": 0,
+                 "last_ok_at": "2026-10-31T01:05:00",
+                 "last": {"ok": true, "mode": "watermark", "minutes": 10080, "sessions": 14,
+                          "scanned": 120, "inserted": 12, "processed": 10, "pages": 2,
+                          "tasks_created": 3, "tasks_updated": 1, "dropped_other": 1,
+                          "failed": 0, "dead_lettered": 0, "failed_queue": 0,
+                          "budget_exhausted": false, "skipped": [], "pending": 3,
+                          "duration_ms": 3210, "at": "2026-10-31T01:05:00"}},
   "tasks": {"pending": 5},
-  "version": "0.1.0"
+  "version": "0.2.0"
 }
 ```
-`source` 表示当前启用的数据源；`weflow` / `wcda` 分别是两个数据源的明细（兼容旧字段）。
+`source` 表示当前启用的数据源；`wcda` 是其明细（兼容字段）；`filters` 是当前监控范围快照。
+
+- `source.connected`：`true` 已连接；`false` 采集轮失败 / 数据源不可达；`null` 首轮采集尚未完成（前端显示「等待首轮采集」）。
+- `source.last_collect_at`：上次采集轮时间（成功或失败，ISO，可为 `null`；与 `collection.last.at` 一致）；`source.last_event_at`：最近一次采集到新消息的时间；`source.last_error`：最近一次错误（无错误为 `null`）。
+- `collection`（`catchup` 是同一 payload 的兼容别名，**deprecated**；前端优先读 `collection`，缺省回退 `catchup`）：`enabled`（是否启用周期采集轮）、`mode`（`watermark` = 按会话 localId 游标 / `off` = 关闭周期轮，此时启动后仍会采一轮）、`seconds`（轮间隔）、`lookback_minutes`（每轮最小回看）、`backfill_minutes`（启动额外回补）、`max_hours`（单会话单轮最长回看）、`page_size`（分页大小）、`round_budget`（每轮处理预算）、`empty_history_hours`（无游标且启动前无历史时的回看窗口）、`overlap_seconds`（退回时间窗时的重叠回看）、`deep_scan_minutes` / `deep_scan_lookback_minutes`（晚到消息深扫间隔 / 回看窗口，`0` = 关闭深扫）、`max_attempts`（单条消息最大重试次数）、`watermarks`（会话游标数）、`cursor_sessions`（已建立 localId 游标的会话数）、`pending_messages` / `pending_sessions`（已入库未处理消息数 / 会话数）、`failed_messages` / `failed_sessions`（失败队列消息数 / 会话数）、`last_ok_at`（上次完全成功时间）、`last`（上次采集结果：`ok`、`mode`、`minutes`、`sessions`、`scanned`、`inserted`、`processed`、`pages`、`tasks_created`、`tasks_updated`、`dropped_other`、`failed`、`dead_lettered`、`failed_queue`、`budget_exhausted`、`skipped`、`pending`、`at`；失败轮 `ok=false` 且带 `reason`；深扫轮带 `deep_scan=true`）。
+- `events.pending_messages` / `events.pending_sessions`：已入库未处理的消息数 / 会话数；`events.failed_messages` / `events.failed_sessions`：失败队列（重试超限）的消息数 / 会话数。
 
 ### 5.1 LLM 设置（网页设置页使用，需要鉴权）
 
@@ -151,7 +174,7 @@ Body（字段都可选）：
 `GET /api/settings/filters`
 ```json
 {"include_private": true, "whitelist_mode": "pinned", "group_whitelist": [],
- "pinned_count": 13, "pinned_ready": true, "only_new_messages": true}
+ "pinned_count": 13, "pinned_ready": true, "data_source": "wcda"}
 ```
 
 `PUT /api/settings/filters`
@@ -218,7 +241,7 @@ Body（字段都可选）：
 {"judgments": {"...": 0}, "last_drops": ["...同上..."]}
 ```
 
-### 5.5 补采 / 置顶同步（实时流漏消息、置顶变化时用，需要鉴权）
+### 5.5 采集 / 置顶同步（按会话 localId 游标采集、置顶变化时用，需要鉴权）
 
 `POST /api/pinned/refresh`
 ```json
@@ -228,44 +251,90 @@ Body（字段都可选）：
 立即同步微信里的置顶变化（不用等 `PINNED_REFRESH_SECONDS` 定时刷新）。后台默认每 60 秒同步一次；
 `pinned` / `pinned_custom` 模式下，新置顶的聊天会自动纳入监控，并按 `WCDA_NEW_PIN_BACKFILL_MINUTES`（默认 120 分钟）自动回补一次，避免置顶前那几分钟的消息漏掉。
 
-补采为**全自动**，不提供手动触发接口：
+采集是 **wcda 的唯一采集方法、全自动**，不提供手动触发接口：
 
-- 服务启动 8 秒后先按会话水位补一次，之后每 `WCDA_CATCHUP_SECONDS`（120 秒）一轮；
-- 每会话从 `catchup_state.last_ts` 继续（水位模式），单轮最长回看 `WCDA_CATCHUP_MAX_HOURS`
-  （默认 168 小时），每轮最多处理约 `WCDA_CATCHUP_ROUND_BUDGET`（默认 2000 条，按批边界最多
-  多出 `BATCH_MESSAGES-1` 条），没处理完的由水位记录、下一轮自动继续；
-- 水位缺失时用「启动前已入库」的最新消息时间续补；启动前也没有该会话历史时，自动回看
-  `WCDA_CATCHUP_EMPTY_HISTORY_HOURS`（默认 24 小时），不盲目拉 7 天；
-- 新置顶群仍自动回补最近 `WCDA_NEW_PIN_BACKFILL_MINUTES`（默认 120 分钟）；
-- 内部 `window` 模式（新置顶/启动额外回补）**不推进水位**，不会影响水位补全；
-- 幂等：已入库的 `rawid` 不会重复处理；任务按 `dedupe_key` 去重；读取失败/积压超过
-  `WCDA_CATCHUP_MAX_MESSAGES` 的会话保留原水位，下一轮自动重试。
+- 服务启动 8 秒后先按会话 `localId` 游标采集一次，之后每 `WCDA_CATCHUP_SECONDS`（120 秒）一轮；
+- **增量游标**：每会话从 `catchup_state.last_local_id` 继续，只收 `localId > 游标` 的消息。`localId` 是微信 WCDB 的写入行序（与 `createTime` 解耦），因此「写入晚、业务时间旧」的晚到消息也能覆盖；WCDA 的 `/api/chat/messages` **没有 localId 过滤参数、分页按 createTime 排序**，客户端逐页过滤，某一页已没有游标之后的行即停止分页；
+- **首次建立游标 / 游标失效**（localId 重装 / 换库 / 回绕）：回退时间窗重采，并把游标重设为本批最大 localId——无游标时用「启动前已入库」的最新消息时间续采；启动前也没有该会话历史时回看 `WCDA_CATCHUP_EMPTY_HISTORY_HOURS`（默认 24 小时）；单会话单轮最长回看 `WCDA_CATCHUP_MAX_HOURS`（默认 168 小时），按 `WCDA_CATCHUP_PAGE_SIZE`（默认 500 条/页）分页；
+- **晚到消息深扫**：因分页按 createTime 排序，晚到消息可能落在游标扫描深度之外，故每 `WCDA_DEEP_SCAN_MINUTES`（默认 60 分钟，`0` = 关闭）按 `WCDA_DEEP_SCAN_LOOKBACK_MINUTES`（默认 1440 分钟）时间窗重扫一次；深扫**不推进 localId 游标**，靠 `rawid` 去重，不会重复建待办；深扫轮的 `last.deep_scan=true`。**晚到消息的兜底上限就是这个深扫回看窗口（默认 24 小时），不是 `WCDA_CATCHUP_MAX_HOURS`（168 小时）**；断网 / 休眠更久后补同步的晚到消息需调大 `WCDA_DEEP_SCAN_LOOKBACK_MINUTES`，代价是每次深扫多翻页；
+- 每轮最多处理约 `WCDA_CATCHUP_ROUND_BUDGET`（默认 2000 条），没处理完的消息保留 `processed=0`，下一轮从 DB 自动兜底继续；
+- 每轮拿到消息后**按会话一次处理**（不再按条数切批）；**同轮新建的待办在轮末合并成一条推送**（标题「微信待办 +N」，最多 6 条明细），采集轮之外的即时推送行为不变；
+- `window` 模式（新置顶回补 / 启动额外回补 / 晚到消息深扫）**不推进游标**，不会影响增量采集；
+- 已采集消息入库时 `processed=0`；处理成功后置 `processed=1`；`existing_message_ids` 只跳过 `processed=1`（已处理）与 `processed=2`（失败队列），`processed=0` 的消息每轮自动兜底重试；失败队列的详细语义见 5.6；
+- **失败重试与失败队列**：小批次（≤30 条）整批失败后逐条隔离重试，能处理的立即处理；**大积压（>30 条）先隔离探测前 30 条**——探测样本**全部**失败视为 LLM / 网络等整体性故障，本轮只写 `last_error`、**不增加 attempts**，下一轮自动重试（不会把积压灌进失败队列）；样本里有成功则按毒消息累计 attempts，多轮逐批排空。连续 3 轮仍整体性失败会推送「采集持续失败」high 告警（`source.last_error` 同步记录，采集轮 `ok` 仍为 `true` 但 `last_error` 非空），避免静默卡住。单条消息累计失败 `MESSAGE_MAX_ATTEMPTS`（默认 3）次后置 `processed=2` 进失败队列，并推送 high 优先级告警（不受免打扰限制），不再阻塞同一会话后续消息；
+- 幂等：任务按 `dedupe_key` 去重；读取失败 / 积压超过 `WCDA_CATCHUP_MAX_MESSAGES` 的会话保留原游标，下一轮自动重试。
 
-`GET /api/catchup/state`（需要鉴权）
+`GET /api/collect/state`（主接口，需要鉴权；`GET /api/catchup/state` 为兼容别名，**deprecated**，返回同一 payload）
 ```json
-{"mode": "watermark", "max_hours": 168, "page_size": 500, "round_budget": 2000,
- "empty_history_hours": 24,
- "watermark_sessions": 14, "states": [{"session_id": "...", "last_ts": 1793100000, "updated_at": "..."}],
- "last": {"ok": true, "mode": "watermark", "inserted": 12, "...": "..."}}
+{"mode": "watermark", "seconds": 120, "lookback_minutes": 30, "backfill_minutes": 0,
+ "max_hours": 168, "page_size": 500, "round_budget": 2000, "empty_history_hours": 24,
+ "overlap_seconds": 300, "deep_scan_minutes": 60, "deep_scan_lookback_minutes": 1440,
+ "max_attempts": 3, "watermark_sessions": 14, "cursor_sessions": 14,
+ "pending_messages": 3, "pending_sessions": 2,
+ "failed_messages": 0, "failed_sessions": 0, "last_ok_at": "2026-10-31T01:05:00",
+ "states": [{"session_id": "...", "last_ts": 1793100000, "last_local_id": 88231,
+             "updated_at": "..."}],
+ "last": {"ok": true, "mode": "watermark", "sessions": 14, "scanned": 120,
+          "inserted": 12, "processed": 10, "pending": 3, "failed": 0,
+          "dead_lettered": 0, "failed_queue": 0, "...": "..."}}
 ```
-排查「补到哪里了」用：`states` 是每会话上次完整扫到的时间（unix 秒），最多返回最近 200 个会话；
-`mode` 在补采关闭/非 wcda 时为 `off`。
+排查「采到哪里了」用：`states` 是每会话游标（`last_ts` 时间水位、`last_local_id` localId 游标；unix 秒 / 行号），
+最多返回最近 200 个会话；`mode` 在周期采集关闭/非 wcda 时为 `off`（关闭周期轮时，服务启动后仍会按游标采一轮）。
 
-补采增强参数（`.env`，均有默认值，不配也能用）：
+采集参数（`.env`，均有默认值，不配也能用）：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `WCDA_CATCHUP_MAX_HOURS` | `168` | 水位模式单会话单轮最长回看（小时） |
-| `WCDA_CATCHUP_EMPTY_HISTORY_HOURS` | `24` | 无水位且启动前无历史时，自动回看窗口（小时） |
+| `WCDA_CATCHUP_SECONDS` | `120` | 采集轮间隔（秒；0=关闭周期轮，仅启动时采一轮） |
+| `WCDA_CATCHUP_LOOKBACK_MINUTES` | `30` | 每轮最小回看（分钟；游标为空/失效时的时间兜底） |
+| `WCDA_BACKFILL_MINUTES` | `0` | 启动时额外按固定窗口回补（分钟，不推进游标） |
+| `WCDA_CATCHUP_MAX_HOURS` | `168` | 单会话单轮最长回看（小时） |
+| `WCDA_CATCHUP_EMPTY_HISTORY_HOURS` | `24` | 无游标且启动前无历史时，自动回看窗口（小时） |
 | `WCDA_CATCHUP_PAGE_SIZE` | `500` | 分页每页条数（WCDA offset/order 分页，范围 50~1000） |
 | `WCDA_CATCHUP_MAX_MESSAGES` | `50000` | 单会话单轮最多拉取条数（防接口异常失控） |
-| `WCDA_CATCHUP_ROUND_BUDGET` | `2000` | 每轮最多处理条数（0=不限制），按批边界略有浮动 |
-| `WCDA_CATCHUP_OVERLAP_SECONDS` | `300` | 水位重叠回看；稳态下被 lookback 覆盖，主要在积压续补时生效 |
-| `WCDA_CATCHUP_BATCH_MESSAGES` | `80` | 每批归纳条数（另受 `EVENT_MAX_CHARS` 字符数约束） |
+| `WCDA_CATCHUP_ROUND_BUDGET` | `2000` | 每轮最多处理条数（0=不限制），未处理消息保留 `processed=0` 下一轮继续 |
+| `WCDA_CATCHUP_OVERLAP_SECONDS` | `300` | 时间水位重叠回看（秒）；只在无 localId 游标、退回时间窗时生效 |
+| `WCDA_NEW_PIN_BACKFILL_MINUTES` | `120` | 新置顶聊天自动回补最近 N 分钟（0=不回补） |
+| `WCDA_DEEP_SCAN_MINUTES` | `60` | 晚到消息深扫间隔（分钟；0=关闭）：按时间窗重扫、不推进游标 |
+| `WCDA_DEEP_SCAN_LOOKBACK_MINUTES` | `1440` | 深扫回看窗口（分钟，默认 24 小时）；晚到消息兜底上限就是它（不是 `WCDA_CATCHUP_MAX_HOURS`），断网更久需调大（代价：每次深扫多翻页） |
+| `MESSAGE_MAX_ATTEMPTS` | `3` | 单条消息处理失败最大重试次数，超限进失败队列并告警 |
 
-后台默认每 `WCDA_CATCHUP_SECONDS`（120 秒）**按水位**自动补采一次；服务启动 8 秒后会先按水位补一次
-（开机/断网恢复后自动追赶）；`WCDA_BACKFILL_MINUTES>0` 时再额外按「固定窗口」补一次，保持旧配置语义。
-`GET /api/health` 的 `catchup` 字段会显示是否启用、参数、水位会话数与最近一次结果。
+后台默认每 `WCDA_CATCHUP_SECONDS`（120 秒）按 localId 游标自动采集一次；服务启动 8 秒后会先按游标采一次
+（开机/断网恢复后自动追赶）；`WCDA_BACKFILL_MINUTES>0` 时再额外按「固定窗口」补一次（不推进游标）。
+`GET /api/health` 的 `collection` 字段（`catchup` 为兼容别名，deprecated）会显示是否启用、参数、游标会话数、待处理消息/会话数、失败队列与最近一次结果。
+
+### 5.6 失败队列（重试超限的消息，需要鉴权）
+
+消息处理状态 `messages.processed`：`0` = 已入库待处理、`1` = 已处理（过滤/归并决策完成）、`2` = 失败队列（重试超限，不再自动重试，需人工重试回到待处理）。
+
+> 整体性故障（大积压整批失败且前 30 条隔离探测样本全部失败，如 LLM / 网络中断）只更新 `last_error`、**不消耗 attempts**，不会进入失败队列，下一轮采集自动重试。
+
+`GET /api/collect/failed?limit=100&offset=0`
+
+- `limit`：1~1000，默认 100；`offset`：默认 0；按 `failed_at` 倒序返回。
+- 返回失败队列快照：
+```json
+{"failed": [{"rawid": "...", "session_id": "123@chatroom", "group_name": "项目群",
+             "sender": "张三", "content": "@我 明早交材料", "ts": 1793099000,
+             "attempts": 3, "last_error": "ValueError: ...",
+             "failed_at": "2026-10-31T01:04:00"}],
+ "count": 1,
+ "sessions": [{"session_id": "123@chatroom", "group_name": "项目群", "failed": 1}],
+ "max_attempts": 3}
+```
+- `failed`：失败消息明细（`attempts` 已尝试次数、`last_error` 最近一次错误、`failed_at` 进入失败队列时间）；`count`：失败消息总数；`sessions`：涉及会话及各自失败条数；`max_attempts`：当前 `MESSAGE_MAX_ATTEMPTS`。
+
+`POST /api/collect/failed/retry`
+
+- body 可省略；可选字段 `rawids`（只重试这些消息）与 `limit`（不传 `rawids` 时按失败时间倒序最多放回多少条，默认 500）。
+```json
+{"rawids": ["..."]}
+```
+```json
+{"ok": true, "requeued": 1, "remaining": 0}
+```
+- 放回的消息置为 `processed=0` 并清空 `attempts/last_error/failed_at`，下一轮采集会自动重新处理；`requeued` 为本次放回条数、`remaining` 为剩余失败队列条数。
+- 设置页「运行状态 → 采集 → 重试失败队列」调用该接口；失败超限时也会推送 high 优先级告警（不受免打扰限制）。
 
 ### 6. 推送自检
 `POST /api/push/test`（需要鉴权）
@@ -280,7 +349,7 @@ Body（字段都可选）：
 ```json
 {"ok": true, "messages": 6, "tasks_created": 3}
 ```
-写入几条虚构微信消息并立即走一次「过滤 → 提取 → 入库 → 推送」，用于没有 WeFlow 时体验。
+写入几条虚构微信消息并立即走一次「过滤 → 提取 → 入库 → 推送」，用于没有 WeChatDataAnalysis 时体验。
 
 > 分桶口径：`due_at` 为空的任务计入 `counts.later`（与 App / 契约 §7 一致）；`counts.done` 为历史完成总数。
 
@@ -310,7 +379,7 @@ Body（字段都可选）：
 
 - 纯静态：`web/index.html` + `web/app.js` + `web/styles.css`，无构建步骤、无 CDN。
 - 设置页 `web/settings.html` 分区顺序：**01 大模型 / 02 手机推送 / 03 消息范围与白名单 / 04 身份与判定 / 05 运行状态 / 06 手机 App（直连同步）/ 07 其余配置**。
-  - 「05 运行状态」读 `GET /api/health`：数据源连接、实时流数、最近消息时间与错误；补采开关/间隔/回看上限/水位会话数/上次结果；置顶模式/数量/就绪；事项账本开放数与缓冲；LLM/推送/待办数/版本。补采为全自动，不提供手动触发；页面提供「同步置顶」（`POST /api/pinned/refresh`）、「刷新状态」两个操作。
+  - 「05 运行状态」读 `GET /api/health`：数据源连接三态（已连接 / 未连接 / 等待首轮采集）、上次采集时间、最近消息时间与错误；采集开关/间隔/回看上限/水位会话数/localId 游标数/待处理消息与会话/失败队列/上次采集结果；置顶模式/数量/就绪；事项账本开放数与待处理数；LLM/待办数/版本。采集为全自动，不提供手动触发；页面提供「同步置顶」（`POST /api/pinned/refresh`）、「刷新状态」与「重试失败队列」（`POST /api/collect/failed/retry`）三个操作。
   - 「06 手机 App」含配对码 + 地址列表 + 最近同步，接口 `/api/app/pairing`，失效时降级提示。
 - 通过 `?token=` 读取并保存到 `localStorage`，之后所有请求带 `X-Auth-Token`；401 时显示设置 token 的界面。
 - 移动优先，底部/顶部分段：今天 / 本周 / 以后 / 已完成；卡片展示标题、截止时间、群名、优先级；点击弹出详情（原文、完成、稍后、忽略）。

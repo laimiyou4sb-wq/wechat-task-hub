@@ -19,10 +19,8 @@ def _settings(tmp_path, llm_enabled=True) -> Settings:
         llm_base_url="http://127.0.0.1:9/v1",
         whitelist_mode="all",
         include_private=True,
-        only_new_messages=False,
         quiet_start="00:00",
         quiet_end="00:00",
-        batch_seconds=0,
     )
 
 

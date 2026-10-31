@@ -172,7 +172,7 @@ def test_convert_keeps_link_card_fields():
 
 
 def test_convert_api_message_for_catchup():
-    """补采用：/api/chat/messages 的原始消息也要能转成内部标准 dict。"""
+    """采集用：/api/chat/messages 的原始消息也要能转成内部标准 dict。"""
     raw = {
         "id": "message_3:Msg_abc:290",
         "localId": 290,

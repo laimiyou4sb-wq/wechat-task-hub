@@ -1,4 +1,4 @@
-"""补采增强：长时间离线后按会话水位 + 分页补齐全部未采集消息。"""
+"""采集增强：长时间离线后按会话水位 + 分页补齐全部未采集消息。"""
 import asyncio
 import time
 
@@ -51,7 +51,6 @@ def _settings(tmp_path, **overrides) -> Settings:
         app_token="test",
         whitelist_mode="all",
         include_private=True,
-        only_new_messages=True,
         llm_enabled=False,
         quiet_start="00:00",
         quiet_end="00:00",
@@ -103,7 +102,7 @@ def _service(tmp_path, sessions, messages, pre_messages=None,
 
 
 def test_watermark_backfills_long_offline_gap_and_dedupes(tmp_path):
-    """停机 3 天后：从上次水位起分页补齐整个空档，重复补采不重复入库/建任务。"""
+    """停机 3 天后：从上次水位起分页补齐整个空档，重复采集不重复入库/建任务。"""
     now = int(time.time())
     session = "room@chatroom"
     sessions = [{"username": session, "name": "项目群", "isGroup": True, "isTop": True}]
@@ -136,6 +135,9 @@ def test_watermark_backfills_long_offline_gap_and_dedupes(tmp_path):
     again = asyncio.run(service.catchup(mode="watermark", minutes=7 * 24 * 60))
     assert again["inserted"] == 0, "同一批消息不应重复入库"
     assert again["tasks_created"] == 0, "同一批消息不应重复建待办"
+    state_after = service.db.get_catchup_state(session)
+    assert state_after is not None and int(state_after["last_local_id"]) == 249, \
+        "localId 游标应停在已采到的最大 localId"
     service.db.close()
 
 
@@ -207,7 +209,7 @@ def test_round_budget_resumes_until_all_collected(tmp_path):
 
 
 def test_window_round_does_not_advance_watermark(tmp_path):
-    """P1 回归：积压续补期间点「立即补采」（window）不能把水位推到 now，否则剩余漏采。"""
+    """P1 回归：积压续补期间再跑一次 window 采集不能把水位推到 now，否则剩余漏采。"""
     now = int(time.time())
     session = "room@chatroom"
     sessions = [{"username": session, "name": "项目群", "isGroup": True, "isTop": True}]
@@ -273,6 +275,9 @@ def test_existing_message_ids_chunks_large_batches(tmp_path):
     db = Database(tmp_path / "chunk.db")
     db.add_message(rawid="keep-1", session_id="s", group_name="g", sender="u", content="c", ts=1)
     ids = [f"missing-{i}" for i in range(1200)] + ["keep-1"]
+    # 未处理（processed=0）的消息不算「已存在」：采集必须重新处理，不能被永久跳过
+    assert db.existing_message_ids(ids) == set()
+    db.mark_messages_processed(["keep-1"])
     assert db.existing_message_ids(ids) == {"keep-1"}
     db.close()
 
@@ -280,7 +285,9 @@ def test_existing_message_ids_chunks_large_batches(tmp_path):
 def test_catchup_state_endpoint(client):
     assert client.get("/api/catchup/state").status_code == 401
     body = client.get("/api/catchup/state", headers=HEADERS).json()
-    # conftest 的数据源是 demo、补采关闭 → mode=off
+    # conftest 的数据源是 demo、采集关闭 → mode=off
     assert body["mode"] == "off"
     assert body["empty_history_hours"] == 24
     assert "watermark_sessions" in body and "states" in body
+    # 新主路径 /api/collect/state 与兼容路径返回同一快照
+    assert client.get("/api/collect/state", headers=HEADERS).json() == body

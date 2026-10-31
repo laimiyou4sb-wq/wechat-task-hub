@@ -1589,7 +1589,7 @@ body.is-dirty .toast {
 }
 
 /* ============================================================
-   运行状态（batch 4）：数据源 / 补采 / 置顶 / 事项账本 / 概况
+   运行状态（batch 4）：数据源 / 采集 / 置顶 / 事项账本 / 概况
    数据全部来自 GET /api/health；沿用 .caldav-meta / .identity-subsection /
    .status-pill，保持白底黑白极简、零彩色。
    ============================================================ */
@@ -1601,7 +1601,7 @@ body.is-dirty .toast {
   border-top: 0;
 }
 
-/* 状态/补采网格比通用三栏更密：按可用宽度自动落 1~3 列，窄屏不溢出 */
+/* 状态/采集网格比通用三栏更密：按可用宽度自动落 1~3 列，窄屏不溢出 */
 .caldav-meta.status-grid {
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
 }

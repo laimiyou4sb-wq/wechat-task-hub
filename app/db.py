@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import uuid
@@ -9,6 +10,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from .utils import now_iso, now_local, parse_iso, to_iso
+
+logger = logging.getLogger(__name__)
 
 # 用户手动添加的待办：网页「手动添加」、手机 App「手机添加」。
 # 这类任务的标题 / 截止时间是用户亲手填的，自动流程只允许补空白字段，绝不改已有内容。
@@ -29,7 +32,15 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT DEFAULT '',
     ts INTEGER DEFAULT 0,
     created_at TEXT DEFAULT '',
-    processed INTEGER DEFAULT 0
+    -- 处理状态：0=已入库未处理（采集兜底队列），1=处理成功（过滤/归并决策已完成），
+    -- 2=失败队列（重试超过上限的毒消息，不再自动重试，不阻塞同会话后续消息）
+    processed INTEGER DEFAULT 0,
+    -- 采集时的标准消息 JSON（含 @名单/引用/链接卡片等未落列字段），用于未处理兜底重放
+    payload TEXT DEFAULT '',
+    -- 处理失败重试：已尝试次数 / 最近一次错误 / 进入失败队列的时间
+    attempts INTEGER DEFAULT 0,
+    last_error TEXT DEFAULT '',
+    failed_at TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
 
@@ -102,10 +113,13 @@ CREATE TABLE IF NOT EXISTS app_actions (
     created_at TEXT DEFAULT ''
 );
 
--- 补采水位：每个会话上次完整扫到的时间（unix 秒），用于长时间离线后的全量补齐
+-- 采集游标：last_local_id = 该会话已采到的最大 localId（微信 WCDB 行序，
+-- 与 createTime 解耦，能兜住「写入晚、业务时间旧」的晚到消息）；last_ts 保留为
+-- 时间水位（首次建立游标 / 游标失效兜底 / 排障展示）。
 CREATE TABLE IF NOT EXISTS catchup_state (
     session_id TEXT PRIMARY KEY,
     last_ts INTEGER DEFAULT 0,
+    last_local_id INTEGER DEFAULT 0,
     updated_at TEXT DEFAULT ''
 );
 """
@@ -144,6 +158,54 @@ class Database:
             "UPDATE revisions SET value = MAX(value, ?) WHERE id = 1",
             (int(row["m"] or 0) + 1,),
         )
+        self._migrate_messages()
+        self._migrate_catchup()
+
+    def _migrate_messages(self) -> None:
+        """messages 表升级：补 payload 列，并把旧版已入库消息一次性标记为已处理。
+
+        旧版采集（原「补采」）是「先归纳成功、再入库」，因此本次升级前已入库的消息
+        都可以视为已处理；不做这个一次性标记，升级后首轮采集会把全部历史消息重新
+        处理一遍，产生重复事项/待办。标记只执行一次（meta 表记录版本），之后新入库
+        的消息才从 processed=0 开始走「已入库未处理」兜底。
+        """
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "processed" not in columns:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN processed INTEGER DEFAULT 0")
+        if "payload" not in columns:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN payload TEXT DEFAULT ''")
+        if "attempts" not in columns:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN attempts INTEGER DEFAULT 0")
+        if "last_error" not in columns:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN last_error TEXT DEFAULT ''")
+        if "failed_at" not in columns:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN failed_at TEXT DEFAULT ''")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_processed ON messages(processed, session_id, ts)")
+        # 失败队列按失败时间倒序展示 / 重试
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_failed ON messages(processed, failed_at)")
+        migrated = self.conn.execute(
+            "SELECT 1 FROM meta WHERE k = 'messages_processed_v1'"
+        ).fetchone()
+        if migrated is None:
+            self.conn.execute("UPDATE messages SET processed = 1")
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta(k, v) VALUES ('messages_processed_v1', ?)",
+                (now_iso(),),
+            )
+            logger.info("messages 处理状态迁移完成：历史消息标记为 processed=1（仅本次）")
+
+    def _migrate_catchup(self) -> None:
+        """采集游标升级：catchup_state 补 last_local_id（localId 增量游标）。
+
+        老库只有时间水位：先留 0，首轮采集按时间水位补齐后再建立 localId 游标。
+        """
+        columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(catchup_state)").fetchall()
+        }
+        if "last_local_id" not in columns:
+            self.conn.execute("ALTER TABLE catchup_state ADD COLUMN last_local_id INTEGER DEFAULT 0")
 
     # ---------- 增量同步：revision 游标 ----------
     def _next_rev(self) -> int:
@@ -197,29 +259,61 @@ class Database:
             )
             self.conn.commit()
 
-    # ---------- 补采水位（长时间离线后的全量补齐） ----------
+    # ---------- 采集游标（localId 增量 + 时间水位） ----------
     def get_catchup_state(self, session_id: str) -> dict | None:
         with self._lock:
             row = self.conn.execute(
-                "SELECT session_id, last_ts, updated_at FROM catchup_state WHERE session_id = ?",
+                "SELECT session_id, last_ts, last_local_id, updated_at FROM catchup_state "
+                "WHERE session_id = ?",
                 (str(session_id or ""),),
             ).fetchone()
         return dict(row) if row else None
 
-    def set_catchup_state(self, session_id: str, last_ts: int) -> None:
+    def set_catchup_state(self, session_id: str, last_ts: int, local_id: int | None = None,
+                          *, reset_local_id: bool = False) -> None:
+        """推进会话游标。
+
+        - ``local_id`` 为 None 时保留已有 localId 游标（只推进时间水位）；
+        - ``reset_local_id=True`` 用于 localId 重装/回绕：直接覆盖为新的游标值；
+        - 其余情况取 ``MAX(已有, 新值)``，避免并发/乱序回退游标。
+        """
+        session = str(session_id or "")
+        ts_value = int(last_ts or 0)
         with self._lock:
-            self.conn.execute(
-                "INSERT INTO catchup_state(session_id, last_ts, updated_at) VALUES (?,?,?) "
-                "ON CONFLICT(session_id) DO UPDATE SET last_ts = excluded.last_ts, "
-                "updated_at = excluded.updated_at",
-                (str(session_id or ""), int(last_ts or 0), now_iso()),
-            )
+            if reset_local_id:
+                cursor = max(0, int(local_id or 0))
+                self.conn.execute(
+                    "INSERT INTO catchup_state(session_id, last_ts, last_local_id, updated_at) "
+                    "VALUES (?,?,?,?) "
+                    "ON CONFLICT(session_id) DO UPDATE SET last_ts = excluded.last_ts, "
+                    "last_local_id = excluded.last_local_id, updated_at = excluded.updated_at",
+                    (session, ts_value, cursor, now_iso()),
+                )
+            elif local_id is None:
+                self.conn.execute(
+                    "INSERT INTO catchup_state(session_id, last_ts, last_local_id, updated_at) "
+                    "VALUES (?,?,0,?) "
+                    "ON CONFLICT(session_id) DO UPDATE SET last_ts = excluded.last_ts, "
+                    "updated_at = excluded.updated_at",
+                    (session, ts_value, now_iso()),
+                )
+            else:
+                cursor = max(0, int(local_id or 0))
+                self.conn.execute(
+                    "INSERT INTO catchup_state(session_id, last_ts, last_local_id, updated_at) "
+                    "VALUES (?,?,?,?) "
+                    "ON CONFLICT(session_id) DO UPDATE SET last_ts = excluded.last_ts, "
+                    "last_local_id = MAX(catchup_state.last_local_id, excluded.last_local_id), "
+                    "updated_at = excluded.updated_at",
+                    (session, ts_value, cursor, now_iso()),
+                )
             self.conn.commit()
 
     def catchup_states(self) -> list[dict]:
         with self._lock:
             rows = self.conn.execute(
-                "SELECT session_id, last_ts, updated_at FROM catchup_state ORDER BY last_ts ASC"
+                "SELECT session_id, last_ts, last_local_id, updated_at FROM catchup_state "
+                "ORDER BY last_ts ASC"
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -239,7 +333,13 @@ class Database:
         return int(row["m"] or 0) if row else 0
 
     def existing_message_ids(self, rawids: list[str]) -> set[str]:
-        """批量查询已入库的消息 id；按 500 分批，规避 SQLite 变量数上限。"""
+        """批量查询**已终结**的消息 id（processed=1 已处理 / processed=2 失败队列）。
+
+        语义要求：只跳过已终结的消息。processed=0 的消息（已入库但未处理）必须
+        返回为空集合，交给采集轮兜底重试；processed=2 的消息已进失败队列，不能
+        在下一轮被当成新消息重新处理（需要人工重试才回到 processed=0）。
+        按 500 分批，规避 SQLite 变量数上限。
+        """
         values = [str(item) for item in rawids if str(item)]
         found: set[str] = set()
         for start in range(0, len(values), 500):
@@ -247,24 +347,277 @@ class Database:
             marks = ",".join("?" for _ in chunk)
             with self._lock:
                 rows = self.conn.execute(
-                    f"SELECT rawid FROM messages WHERE rawid IN ({marks})", tuple(chunk)
+                    f"SELECT rawid FROM messages WHERE rawid IN ({marks}) AND processed IN (1, 2)",
+                    tuple(chunk),
                 ).fetchall()
             found.update(str(row["rawid"]) for row in rows)
         return found
 
     # ---------- messages ----------
     def add_message(self, rawid: str, session_id: str, group_name: str, sender: str,
-                    content: str, ts: int) -> bool:
+                    content: str, ts: int, *, processed: int = 0,
+                    payload: dict | None = None) -> bool:
+        """入库一条消息；采集路径默认 processed=0（等待处理），处理成功后置 1。"""
         if not rawid:
             rawid = f"local-{uuid.uuid4().hex}"
+        payload_text = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else ""
         with self._lock:
             cur = self.conn.execute(
-                "INSERT OR IGNORE INTO messages(rawid, session_id, group_name, sender, content, ts, created_at) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (rawid, session_id or "", group_name or "", sender or "", content or "", int(ts or 0), now_iso()),
+                "INSERT OR IGNORE INTO messages(rawid, session_id, group_name, sender, content, ts, "
+                "created_at, processed, payload) VALUES (?,?,?,?,?,?,?,?,?)",
+                (rawid, session_id or "", group_name or "", sender or "", content or "",
+                 int(ts or 0), now_iso(), 1 if processed else 0, payload_text),
             )
             self.conn.commit()
             return cur.rowcount > 0
+
+    def add_messages(self, items: list[dict]) -> int:
+        """批量入库采集到的标准消息（processed=0，保留完整 payload）；返回新增条数。
+
+        已存在（processed=1 已处理 / processed=2 失败队列）的 rawid 由 INSERT OR IGNORE
+        原样保留，不会把已终结消息重置回未处理。
+        """
+        inserted = 0
+        with self._lock:
+            for item in items:
+                rawid = str(item.get("rawid") or "")
+                if not rawid:
+                    rawid = f"local-{uuid.uuid4().hex}"
+                payload_text = json.dumps(item, ensure_ascii=False)
+                cur = self.conn.execute(
+                    "INSERT OR IGNORE INTO messages(rawid, session_id, group_name, sender, content, ts, "
+                    "created_at, processed, payload) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (rawid, str(item.get("session_id") or ""), str(item.get("group_name") or ""),
+                     str(item.get("sender") or ""), str(item.get("content") or ""),
+                     int(item.get("ts") or 0), now_iso(), 0, payload_text),
+                )
+                inserted += 1 if cur.rowcount > 0 else 0
+            self.conn.commit()
+        return inserted
+
+    def mark_messages_processed(self, rawids: list[str], processed: int = 1) -> int:
+        """把一批消息的处理状态置为 processed（默认 1）；返回实际更新条数。
+
+        成功置 1 时顺手清空失败重试记录（attempts/last_error/failed_at），
+        避免后续排查时误导。
+        """
+        values = [str(item) for item in rawids if str(item)]
+        if not values:
+            return 0
+        updated = 0
+        with self._lock:
+            for start in range(0, len(values), 500):
+                chunk = values[start:start + 500]
+                marks = ",".join("?" for _ in chunk)
+                if processed:
+                    cur = self.conn.execute(
+                        f"UPDATE messages SET processed = ?, attempts = 0, last_error = '', "
+                        f"failed_at = '' WHERE rawid IN ({marks})",
+                        (1, *chunk),
+                    )
+                else:
+                    cur = self.conn.execute(
+                        f"UPDATE messages SET processed = 0 WHERE rawid IN ({marks})",
+                        (0, *chunk),
+                    )
+                updated += max(0, int(cur.rowcount or 0))
+            self.conn.commit()
+        return updated
+
+    def record_message_errors(self, rawids: list[str], error: str) -> int:
+        """只记录 last_error、**不**增加 attempts（用于整体性故障，如 LLM/网络中断）。
+
+        与 :meth:`record_message_failures` 的区别：整体性故障不代表消息本身有问题，
+        不消耗重试次数，下一轮仍按待处理自动重试，避免一次短时故障把整批积压打进
+        失败队列。
+        """
+        values = [str(item) for item in rawids if str(item)]
+        if not values:
+            return 0
+        message = str(error or "")[:300]
+        updated = 0
+        with self._lock:
+            for start in range(0, len(values), 500):
+                chunk = values[start:start + 500]
+                marks = ",".join("?" for _ in chunk)
+                cur = self.conn.execute(
+                    f"UPDATE messages SET last_error = ? WHERE rawid IN ({marks})",
+                    (message, *chunk),
+                )
+                updated += max(0, int(cur.rowcount or 0))
+            self.conn.commit()
+        return updated
+
+    def record_message_failures(self, rawids: list[str], error: str,
+                                max_attempts: int) -> dict:
+        """记录一批消息的处理失败，返回本次达到重试上限、进入失败队列的消息。
+
+        返回 ``{"dead": [rawid, ...], "detail": {rawid: attempts}}``。
+        达到 ``max_attempts`` 的消息置 processed=2（失败队列），不再自动重试，
+        因此同会话后续消息不会被它一直拖住。
+        """
+        values = [str(item) for item in rawids if str(item)]
+        limit = max(1, int(max_attempts or 1))
+        message = str(error or "")[:300]
+        at = now_iso()
+        dead: list[str] = []
+        detail: dict[str, int] = {}
+        if not values:
+            return {"dead": dead, "detail": detail}
+        with self._lock:
+            for start in range(0, len(values), 500):
+                chunk = values[start:start + 500]
+                marks = ",".join("?" for _ in chunk)
+                self.conn.execute(
+                    f"UPDATE messages SET attempts = attempts + 1, last_error = ? "
+                    f"WHERE rawid IN ({marks})",
+                    (message, *chunk),
+                )
+                rows = self.conn.execute(
+                    f"SELECT rawid, attempts FROM messages WHERE rawid IN ({marks})",
+                    tuple(chunk),
+                ).fetchall()
+                chunk_dead: list[str] = []
+                for row in rows:
+                    rawid = str(row["rawid"])
+                    attempts = int(row["attempts"] or 0)
+                    detail[rawid] = attempts
+                    if attempts >= limit:
+                        chunk_dead.append(rawid)
+                if chunk_dead:
+                    marks_dead = ",".join("?" for _ in chunk_dead)
+                    self.conn.execute(
+                        f"UPDATE messages SET processed = 2, failed_at = ? "
+                        f"WHERE rawid IN ({marks_dead})",
+                        (at, *chunk_dead),
+                    )
+                    dead.extend(chunk_dead)
+            self.conn.commit()
+        return {"dead": dead, "detail": detail}
+
+    def failed_messages(self, limit: int = 100, offset: int = 0) -> list[dict]:
+        """失败队列：重试超限、等待人工处理的消息（按失败时间倒序）。"""
+        limit = max(1, min(int(limit or 100), 1000))
+        offset = max(0, int(offset or 0))
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT rawid, session_id, group_name, sender, content, ts, attempts, "
+                "last_error, failed_at FROM messages WHERE processed = 2 "
+                "ORDER BY failed_at DESC, id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_failed_messages(self) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS c FROM messages WHERE processed = 2"
+            ).fetchone()
+        return int(row["c"] or 0) if row else 0
+
+    def failed_sessions(self) -> list[dict]:
+        """失败队列涉及的会话（排障 / 设置页展示用）。"""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT session_id, MAX(group_name) AS group_name, COUNT(*) AS failed "
+                "FROM messages WHERE processed = 2 GROUP BY session_id ORDER BY MAX(failed_at) DESC"
+            ).fetchall()
+        return [{"session_id": str(row["session_id"]),
+                 "group_name": str(row["group_name"] or ""),
+                 "failed": int(row["failed"] or 0)} for row in rows]
+
+    def requeue_failed_messages(self, rawids: list[str] | None = None,
+                                limit: int = 500) -> int:
+        """把失败队列消息放回待处理（processed=0，attempts 清零）以便重试。
+
+        不传 rawids 时按失败时间倒序取最多 ``limit`` 条（设置页「重试失败队列」）。
+        """
+        with self._lock:
+            if rawids:
+                values = [str(item) for item in rawids if str(item)]
+                if not values:
+                    return 0
+                updated = 0
+                for start in range(0, len(values), 500):
+                    chunk = values[start:start + 500]
+                    marks = ",".join("?" for _ in chunk)
+                    cur = self.conn.execute(
+                        f"UPDATE messages SET processed = 0, attempts = 0, last_error = '', "
+                        f"failed_at = '' WHERE rawid IN ({marks}) AND processed = 2",
+                        tuple(chunk),
+                    )
+                    updated += max(0, int(cur.rowcount or 0))
+            else:
+                ids = [str(row["rawid"]) for row in self.conn.execute(
+                    "SELECT rawid FROM messages WHERE processed = 2 "
+                    "ORDER BY failed_at DESC, id DESC LIMIT ?",
+                    (max(1, int(limit or 500)),),
+                ).fetchall()]
+                updated = 0
+                if ids:
+                    marks = ",".join("?" for _ in ids)
+                    cur = self.conn.execute(
+                        f"UPDATE messages SET processed = 0, attempts = 0, last_error = '', "
+                        f"failed_at = '' WHERE rawid IN ({marks}) AND processed = 2",
+                        tuple(ids),
+                    )
+                    updated = max(0, int(cur.rowcount or 0))
+            self.conn.commit()
+        return updated
+
+    def unprocessed_messages(self, session_id: str, limit: int = 0) -> list[dict]:
+        """该会话「已入库未处理」的消息（时间升序，用于采集兜底重放）。
+
+        payload 里保存了采集时的完整标准消息（@名单、引用、链接卡片等），
+        重新处理时与首次处理等价；老数据没有 payload 时退回列字段。
+        """
+        sql = ("SELECT rawid, session_id, group_name, sender, content, ts, payload "
+               "FROM messages WHERE session_id = ? AND processed = 0 ORDER BY ts ASC, id ASC")
+        params: list = [str(session_id or "")]
+        if int(limit or 0) > 0:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        messages: list[dict] = []
+        for row in rows:
+            message: dict = {}
+            if row["payload"]:
+                try:
+                    loaded = json.loads(row["payload"])
+                    if isinstance(loaded, dict):
+                        message = loaded
+                except (TypeError, ValueError):
+                    message = {}
+            message.update({
+                "rawid": str(row["rawid"]),
+                "session_id": str(row["session_id"]),
+                "group_name": str(row["group_name"] or message.get("group_name") or ""),
+                "sender": str(row["sender"] or message.get("sender") or ""),
+                "content": str(row["content"] or message.get("content") or ""),
+                "ts": int(row["ts"] or 0),
+            })
+            message.setdefault("is_group", str(row["session_id"]).endswith("@chatroom"))
+            message.setdefault("event", "message.new")
+            messages.append(message)
+        return messages
+
+    def unprocessed_sessions(self) -> list[dict]:
+        """存在「已入库未处理」消息的会话列表（采集兜底目标）。"""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT session_id, MAX(group_name) AS group_name, COUNT(*) AS pending "
+                "FROM messages WHERE processed = 0 GROUP BY session_id ORDER BY MAX(ts) ASC"
+            ).fetchall()
+        return [{"session_id": str(row["session_id"]), "group_name": str(row["group_name"] or ""),
+                 "pending": int(row["pending"] or 0)} for row in rows]
+
+    def count_unprocessed(self) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS c FROM messages WHERE processed = 0"
+            ).fetchone()
+        return int(row["c"] or 0) if row else 0
 
     def messages_by_ids(self, ids: list[str]) -> list[dict]:
         if not ids:
@@ -497,6 +850,21 @@ class Database:
                 f"SELECT * FROM tasks WHERE status = 'pending' AND group_name IN ({marks}) "
                 "ORDER BY created_at DESC LIMIT ?",
                 (*MANUAL_GROUPS, max(1, int(limit))),
+            ).fetchall()
+        return [self._task_dict(row) for row in rows]
+
+    def list_manual_ignored(self, since: str, limit: int = 20) -> list[dict]:
+        """最近一段时间内被忽略的手动待办（按忽略时间倒序），用于「同类消息不再重复建」抑制。
+
+        ``since`` 为 ISO 时间下界（= 现在 - MANUAL_SUPPRESS_DAYS 天）；忽略任务不会再被
+        改写，``updated_at`` 即忽略时间（取消忽略后再忽略会刷新，窗口随之顺延）。
+        """
+        marks = ",".join("?" for _ in MANUAL_GROUPS)
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT * FROM tasks WHERE status = 'ignored' AND group_name IN ({marks}) "
+                "AND updated_at >= ? ORDER BY updated_at DESC LIMIT ?",
+                (*MANUAL_GROUPS, str(since or ""), max(1, int(limit))),
             ).fetchall()
         return [self._task_dict(row) for row in rows]
 

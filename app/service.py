@@ -5,7 +5,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote
 
 from .config import Settings
@@ -17,50 +17,86 @@ from .filters import EVENT_HINTS, has_action_hint, is_worth_summarizing, should_
 from .identity import IdentityContext, IdentityResolver
 from .mentions import classify_message
 from .push import Pusher
-from .utils import clip, human_due, in_quiet_hours, now_iso, now_local
+from .utils import clip, human_due, in_quiet_hours, now_iso, now_local, to_iso
 from .wcda import WcdaClient
-from .weflow import WeFlowClient
 
 logger = logging.getLogger(__name__)
 
+#: 演示模式（POST /api/demo/seed）用的虚构消息，不访问网络。
+DEMO_MESSAGES: list[dict] = [
+    {"group": "项目群", "sender": "李老师",
+     "content": "【通知】本周五18:00前提交报名表，逾期不候，表格在群文件。", "ago": 300},
+    {"group": "项目群", "sender": "王同学",
+     "content": "明天下午3点开组会，记得带上上周的材料。", "ago": 240},
+    {"group": "项目群", "sender": "张三", "content": "哈哈哈哈这也行", "ago": 200},
+    {"group": "课程群", "sender": "助教",
+     "content": "大家记得10月28日之前交作业，提交到学习通。", "ago": 160},
+    {"group": "课程群", "sender": "李四", "content": "收到", "ago": 120},
+    {"group": "生活群", "sender": "快递驿站",
+     "content": "今晚8点前把取件码发我，不然要退回。", "ago": 80},
+]
+
+
+def demo_messages() -> list[dict]:
+    """演示用虚构消息（不访问网络），字段与采集路径的标准消息一致。"""
+    now = int(time.time())
+    messages: list[dict] = []
+    for index, sample in enumerate(DEMO_MESSAGES):
+        messages.append({
+            "rawid": f"demo-{now}-{index}",
+            "session_id": f"demo-{index}@chatroom",
+            "group_name": sample["group"],
+            "sender": sample["sender"],
+            "content": sample["content"],
+            "ts": now - int(sample["ago"]),
+            "is_group": True,
+            "event": "message.new",
+            "at_usernames": [],
+            "at_names": [],
+            "quote_username": "",
+        })
+    return messages
+
 
 class AppService:
+    #: 整批处理失败后逐条隔离重试的最大条数；超过后整批只计一次失败，避免放大耗时
+    _ISOLATE_LIMIT = 30
+
     def __init__(self, settings: Settings):
         self.settings = settings
         self.db = Database(settings.db_path)
         self.pusher = Pusher(settings)
-        self.weflow = WeFlowClient(settings)
         self.wcda = WcdaClient(settings)
         self.data_source = settings.data_source
-        if self.data_source == "wcda":
-            self.source = self.wcda
-        elif self.data_source == "weflow":
-            self.source = self.weflow
-        else:  # demo / 其它：不连接真实数据源
-            self.source = None
-        self.session_buffers: dict[str, list[dict]] = {}
-        self.session_first_at: dict[str, float] = {}
-        self.session_last_at: dict[str, float] = {}
-        self.session_group: dict[str, str] = {}
+        # 唯一数据源是 wcda；demo / 其它不连接真实数据源
+        self.source = self.wcda if self.data_source == "wcda" else None
         # @/点名 身份判定（只过滤“明确指向他人”的消息，详见 app/mentions.py）
         self.identity = IdentityResolver(settings, self.wcda if self.data_source == "wcda" else None)
         self._judge_stats = {"kept_me": 0, "kept_all": 0, "kept_none": 0, "dropped_other": 0}
         self._judge_since = now_iso()
         self._recent_drops: deque[dict] = deque(maxlen=20)
-        self.connected = False
+        # 连接状态：由采集轮驱动（None=首轮采集尚未完成；True/False=最近一轮结果）
+        self.connected: bool | None = None
         self.last_event_at: str | None = None
         self.last_error: str | None = None
         self._sessions_cache: list[dict] = []
-        self._last_catchup: dict | None = None
+        self._last_collection: dict | None = None
+        self._last_collect_at: str | None = None
+        self._last_collect_ok_at: str | None = None
         self._force_allow_sessions: set[str] = set()
-        # wcda 单会话实时流（workaround：WCDA 全量 SSE 存在不推送的 bug）
-        self._stream_tasks: dict[str, asyncio.Task] = {}
-        self._stream_group_names: dict[str, str] = {}
         self._last_digest_date: str | None = None
         self._last_cleanup_date: str | None = None
         self._workers: list[asyncio.Task] = []
+        # 采集轮串行化：避免周期轮 / 新置顶回补 / 深扫并发写同一份「同轮推送」收集器
+        self._collect_lock = asyncio.Lock()
         self.started_at = now_iso()
-        self.started_ts = time.time()
+        # 同轮合并推送：采集轮开始时建立收集器，轮末只发一条汇总推送
+        self._round_push: dict | None = None
+        # 晚到消息兜底深扫：距上次深扫超过 WCDA_DEEP_SCAN_MINUTES 才再扫
+        self._last_deep_scan_at = time.monotonic()
+        # 处理整体性故障的连续轮次（每会话）：连续多轮全失败时升级告警，
+        # 避免「大积压 + 全毒消息」这类边界被静默卡住
+        self._global_failure_streaks: dict[str, int] = {}
         # 置顶白名单（来自 WeChatDataAnalysis 的会话列表）
         self.pinned_sessions: set[str] = set()
         self.pinned_names: dict[str, str] = {}
@@ -70,35 +106,23 @@ class AppService:
     # ---------- lifecycle ----------
     async def start(self) -> None:
         self._workers = [
-            asyncio.create_task(self._event_loop(), name="event-worker"),
             asyncio.create_task(self._daily_loop(), name="daily"),
         ]
         if self.data_source == "wcda" and self.wcda.configured:
-            # WCDA 的“全量”实时流实测经常不推送，改为按会话逐个订阅（单会话 SSE 是正常的）
-            self._workers.append(asyncio.create_task(self._wcda_stream_manager(), name="wcda-streams"))
-        else:
-            self._workers.append(asyncio.create_task(self._sse_loop(), name=f"{self.data_source}-sse"))
-        if self.data_source == "weflow" and self.settings.weflow_configured and self.settings.catchup_minutes > 0 \
-                and not self.settings.only_new_messages:
-            self._workers.append(asyncio.create_task(self._catchup(), name="catchup"))
-        # wcda 补采兜底（单会话实时流异常/漏消息时兜底；也用于新监控群的历史回补）
-        if (self.data_source == "wcda" and self.wcda.configured
-                and (self.settings.wcda_catchup_seconds > 0
-                     or self.settings.wcda_catchup_on_start_minutes > 0)):
-            self._workers.append(asyncio.create_task(self._catchup_loop(), name="wcda-catchup"))
+            # wcda 唯一采集方法：后台采集轮（localId 游标 + 按会话轮询 REST）
+            if not self._collect_enabled():
+                logger.warning("wcda 采集未启用周期轮次（WCDA_CATCHUP_SECONDS=0）：只在启动时采集一次，"
+                               "之后不会自动生成待办")
+            self._workers.append(asyncio.create_task(self._collect_loop(), name="wcda-collect"))
         if self._needs_pinned() or self.data_source == "wcda":
             self._workers.append(asyncio.create_task(self._pinned_loop(), name="pinned-refresh"))
-        logger.info("服务已启动：%s（数据源 %s，仅新消息=%s，白名单=%s）",
-                    self.settings.base_url, self.data_source,
-                    self.settings.only_new_messages, self.settings.whitelist_mode)
+        logger.info("服务已启动：%s（数据源 %s，白名单=%s）",
+                    self.settings.base_url, self.data_source, self.settings.whitelist_mode)
 
     async def stop(self) -> None:
         for worker in self._workers:
             worker.cancel()
-        for task in list(self._stream_tasks.values()):
-            task.cancel()
-        await asyncio.gather(*self._workers, *self._stream_tasks.values(), return_exceptions=True)
-        self._stream_tasks.clear()
+        await asyncio.gather(*self._workers, return_exceptions=True)
         self.db.close()
 
     # ---------- 数据源 ----------
@@ -116,7 +140,7 @@ class AppService:
                                 "、".join(self.pinned_names.get(sid, sid) for sid in new_sessions))
                     if minutes > 0 and self.data_source == "wcda" and self.wcda.configured:
                         try:
-                            await self.catchup(minutes=minutes, session_ids=new_sessions)
+                            await self.collect(minutes=minutes, session_ids=new_sessions)
                         except Exception as error:  # noqa: BLE001 - 回补失败不影响监控
                             logger.warning("新置顶会话回补失败：%s", error)
             except asyncio.CancelledError:
@@ -153,7 +177,7 @@ class AppService:
         return added
 
     async def refresh_pinned(self) -> list[str]:
-        """刷新置顶会话；返回这次新增置顶的会话（用于自动补采）。"""
+        """刷新置顶会话；返回这次新增置顶的会话（用于自动采集回补）。"""
         sessions = await self.wcda.fetch_sessions()
         if not sessions:
             return []
@@ -161,134 +185,7 @@ class AppService:
         logger.info("已同步置顶会话 %s 个", len(self.pinned_sessions))
         return added
 
-    def _handle_stream_message(self, message: dict) -> None:
-        """实时流收到一条消息：去重入库 + 进缓冲，顺手记录连接状态。"""
-        if message.get("event") == "stream.ready":
-            self.connected = True
-            self.last_error = None
-            self.last_event_at = now_iso()
-            return
-        if message.get("event") == "message.revoke" or not message.get("rawid"):
-            return
-        # 只处理服务启动之后“新收到”的消息，避免回溯历史
-        if not self._is_new_message(message):
-            return
-        self.connected = True
-        self.last_error = None
-        self.last_event_at = now_iso()
-        # 不在白名单里的会话直接丢弃，不占缓冲、不写库
-        if not self._message_allowed(message):
-            return
-        inserted = self.db.add_message(
-            rawid=message["rawid"], session_id=message["session_id"],
-            group_name=message["group_name"], sender=message["sender"],
-            content=message["content"], ts=message["ts"],
-        )
-        if inserted:
-            self._buffer_message(message)
-
-    async def _sse_loop(self) -> None:
-        backoff = 5
-        while True:
-            if self.source is None or not self.source.configured:
-                await asyncio.sleep(30)
-                continue
-            try:
-                async for message in self.source.stream_messages():
-                    self._handle_stream_message(message)
-                self.connected = False
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                self.connected = False
-                self.last_error = f"{type(error).__name__}: {error}"[:300]
-                logger.warning("%s 实时流断开：%s（%s 秒后重连）", self.data_source, error, backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-                continue
-            backoff = 5
-            await asyncio.sleep(3)
-
-    # ---------- wcda 单会话实时流（绕开 WCDA 全量 SSE 的 bug） ----------
-    async def _wcda_stream_manager(self) -> None:
-        """按“当前监控会话”维护一组单会话 SSE 连接：置顶变化后自动增删连接。"""
-        await asyncio.sleep(3)
-        interval = min(60, max(10, int(self.settings.pinned_refresh_seconds)))
-        while True:
-            try:
-                targets = await self._monitored_sessions()
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001
-                logger.warning("实时流订阅：刷新监控会话失败：%s", error)
-                targets = []
-            desired = {
-                str(item.get("session_id")): str(item.get("group_name") or "")
-                for item in targets if item.get("session_id")
-            }
-            # 取消已不在监控范围的连接
-            for session_id in list(self._stream_tasks):
-                if session_id not in desired:
-                    task = self._stream_tasks.pop(session_id, None)
-                    self._stream_group_names.pop(session_id, None)
-                    if task is not None:
-                        task.cancel()
-            # 给新会话建立连接
-            for session_id, group_name in desired.items():
-                task = self._stream_tasks.get(session_id)
-                if task is not None and not task.done():
-                    continue
-                self._stream_group_names[session_id] = group_name
-                self._stream_tasks[session_id] = asyncio.create_task(
-                    self._wcda_session_stream(session_id, group_name),
-                    name=f"wcda-stream-{session_id[:16]}",
-                )
-            await asyncio.sleep(interval)
-
-    async def _wcda_session_stream(self, session_id: str, group_name: str) -> None:
-        backoff = 3
-        label = group_name or session_id
-        while True:
-            try:
-                async for message in self.wcda.stream_messages(username=session_id):
-                    self._handle_stream_message(message)
-                backoff = 3
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001
-                self.connected = False
-                self.last_error = f"{type(error).__name__}: {error}"[:300]
-                logger.warning("单会话实时流断开（%s）：%s（%s 秒后重连）", label, error, backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-                continue
-            await asyncio.sleep(2)
-
-    async def _catchup(self) -> None:
-        if self.settings.only_new_messages:
-            return
-        try:
-            await asyncio.sleep(3)
-            messages = await self.weflow.fetch_recent(self.settings.catchup_minutes)
-            if not messages:
-                return
-            inserted = []
-            for message in messages:
-                if self.db.add_message(
-                    rawid=message["rawid"], session_id=message["session_id"],
-                    group_name=message["group_name"], sender=message["sender"],
-                    content=message["content"], ts=message["ts"],
-                ):
-                    inserted.append(message)
-            if inserted:
-                logger.info("补采到 %s 条消息，立即归纳", len(inserted))
-                await self.process_batch(inserted)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            logger.warning("补采失败：%s", error)
-
-    # ---------- wcda 补采兜底 ----------
+    # ---------- wcda 采集（唯一采集方法） ----------
     async def _monitored_sessions(self) -> list[dict]:
         """当前监控范围内的会话（置顶 + 自定义名单），顺带同步置顶变化。"""
         sessions = await self.wcda.fetch_sessions(limit=500)
@@ -312,12 +209,11 @@ class AppService:
             targets.append({"session_id": session_id, "group_name": group_name})
         return targets
 
-    # ---------- wcda 补采兜底 ----------
-    def _catchup_window_seconds(self, minutes: int | None, mode: str) -> int:
-        """本轮补采的回看上限（秒）。
+    def _collection_window_seconds(self, minutes: int | None, mode: str) -> int:
+        """本轮采集的回看上限（秒）。
 
-        - ``window``：固定回看 ``minutes``（缺省 WCDA_CATCHUP_LOOKBACK_MINUTES），与旧行为一致；
-        - ``watermark``：按会话水位补，上限 ``WCDA_CATCHUP_MAX_HOURS``（可传 minutes 覆盖）。
+        - ``window``：固定回看 ``minutes``（缺省 WCDA_CATCHUP_LOOKBACK_MINUTES）；
+        - ``watermark``：按会话水位采，上限 ``WCDA_CATCHUP_MAX_HOURS``（可传 minutes 覆盖）。
         """
         settings = self.settings
         if mode == "watermark":
@@ -327,15 +223,15 @@ class AppService:
         window_minutes = int(minutes if minutes is not None else settings.wcda_catchup_lookback_minutes)
         return max(1, min(window_minutes, 7 * 24 * 60)) * 60
 
-    def _catchup_since_ts(self, session_id: str, *, mode: str,
-                          window_seconds: int, now_ts: int) -> int:
-        """本轮该会话的起始时间（unix 秒）。
+    def _collection_since_ts(self, session_id: str, *, mode: str,
+                             window_seconds: int, now_ts: int) -> int:
+        """本轮该会话的采集起始时间（unix 秒）。
 
-        window 模式固定回看；watermark 模式从该会话上次补采水位继续：
-        - 水位缺失时用「本进程启动前已入库」的最新消息时间（首次接管），不用启动后实时流
-          刚写入的新消息，否则会把离线积压误判成已覆盖；
+        window 模式固定回看；watermark 模式从该会话上次采集水位继续：
+        - 水位缺失时用「本进程启动前已入库」的最新消息时间（首次接管），不用启动后
+          采集轮刚写入的新消息，否则会把离线积压误判成已覆盖；
         - 启动前也没有该会话任何历史时，自动回看 ``WCDA_CATCHUP_EMPTY_HISTORY_HOURS``（默认 1 天）；
-        - 任何时候都至少回看 lookback，兜住实时流漏掉的消息；
+        - 任何时候都至少回看 lookback，覆盖两轮采集之间的新消息；
         - 单轮最远回看到 now - window_seconds，避免一次扫穿全部历史。
         """
         settings = self.settings
@@ -355,33 +251,76 @@ class AppService:
         return max(floor, min(watermark - overlap, now_ts - lookback))
 
     @staticmethod
-    def _catchup_row_ts(row: dict) -> int:
-        """容错读取 WCDA 消息时间戳（非数字按 0 处理，不让整轮补采失败）。"""
+    def _collect_row_ts(row: dict) -> int:
+        """容错读取 WCDA 消息时间戳（非数字按 0 处理，不让整轮采集中断）。"""
         try:
             return int(row.get("createTime") or 0)
         except (TypeError, ValueError):
             return 0
 
-    async def _fetch_catchup_rows(self, session_id: str, since_ts: int) -> dict:
-        """读取该会话 since_ts 之后的消息（分页从最新往前回溯）。
+    @staticmethod
+    def _collect_row_local_id(row: dict) -> int:
+        """容错读取 WCDA 行序 localId（缺失/非数字按 0 处理）。
 
-        返回 ``{"ok", "rows", "complete", "pages", "error"}``：
-        - ``ok=False`` 表示读取失败或积压超过单轮上限，调用方应跳过该会话、保留水位；
-        - ``rows`` 已按时间升序排列。
+        localId 是微信 WCDB 的写入行序，与 createTime 解耦：PC 断网/休眠后补同步的
+        「写入晚、业务时间旧」消息会拿到**新的 localId**，这正是时间窗采不到的晚到消息。
+        """
+        try:
+            return int(row.get("localId") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    async def _fetch_collect_rows(self, session_id: str, since_ts: int, *,
+                                  cursor: int = 0, watermark_ts: int = 0,
+                                  floor_ts: int | None = None) -> dict:
+        """读取该会话游标之后的消息（localId 增量游标；首轮/无 localId 时按时间窗）。
+
+        分页按 createTime 倒序，因此采用「逐页过滤 + 边界页停止」：
+
+        - 游标模式（``cursor > 0``）：凡是 ``localId > cursor`` 的行都收下（不管
+          createTime 多旧，用来兜住晚到消息）；某一页已经没有游标之后的行，
+          说明已经翻过游标边界，停止分页；
+        - 首次建立游标（``cursor == 0``）：按 ``since_ts`` 时间窗收消息，并顺带返回
+          本批最大 localId，供下一轮作为游标；
+        - ``floor_ts``：更深的历史不再翻（默认等于 ``since_ts``）；游标模式传
+          ``now - WCDA_CATCHUP_MAX_HOURS``，允许为找晚到消息翻得更深；
+        - localId 回绕/重装：首页整页 ``localId <= cursor``，却出现比上轮时间水位
+          更新的消息 → 说明本地库 localId 被重置，本轮弃用旧游标、按时间窗重采。
+
+        返回 ``{"ok", "rows", "complete", "pages", "error", "local_id", "cursor_reset"}``：
+        - ``ok=False`` 表示读取失败或积压超过单轮上限，调用方应跳过该会话、保留游标；
+        - ``rows`` 已按时间升序排列；``local_id`` 是本批最大 localId。
         """
         settings = self.settings
+        floor = int(since_ts if floor_ts is None else floor_ts)
+        cursor_mode = int(cursor or 0) > 0
+        max_local_id = 0
+        cursor_reset = False
         fetcher = getattr(self.wcda, "fetch_messages_page", None)
         if not callable(fetcher):
             # 兼容旧客户端 / 测试桩：退化为单次读取最近消息
             reader = getattr(self.wcda, "fetch_recent_messages", None)
             batch = await reader(session_id, limit=settings.wcda_catchup_limit) if callable(reader) else []
-            rows = [row for row in batch if self._catchup_row_ts(row) >= since_ts]
-            rows.sort(key=self._catchup_row_ts)
-            return {"ok": True, "rows": rows, "complete": True, "pages": 1}
+            rows: list[dict] = []
+            for row in batch:
+                if not isinstance(row, dict):
+                    continue
+                row_local_id = self._collect_row_local_id(row)
+                max_local_id = max(max_local_id, row_local_id)
+                if cursor_mode:
+                    keep = row_local_id > cursor or (
+                        row_local_id <= 0 and self._collect_row_ts(row) >= since_ts)
+                else:
+                    keep = self._collect_row_ts(row) >= since_ts
+                if keep:
+                    rows.append(row)
+            rows.sort(key=self._collect_row_ts)
+            return {"ok": True, "rows": rows, "complete": True, "pages": 1,
+                    "local_id": max_local_id, "cursor_reset": False}
 
         page_size = max(50, min(int(settings.wcda_catchup_page_size), 1000))
         max_rows = max(1000, int(settings.wcda_catchup_max_messages))
-        rows: list[dict] = []
+        rows = []
         seen: set[str] = set()
         offset = 0
         pages = 0
@@ -390,10 +329,22 @@ class AppService:
             pages += 1
             if not page.get("ok"):
                 return {"ok": False, "rows": rows, "complete": False, "pages": pages,
-                        "error": page.get("error") or "fetch_failed"}
+                        "error": page.get("error") or "fetch_failed",
+                        "local_id": max_local_id, "cursor_reset": cursor_reset}
             batch = [row for row in (page.get("messages") or []) if isinstance(row, dict)]
             if not batch:
                 break
+            page_max_local_id = max(self._collect_row_local_id(row) for row in batch)
+            page_max_ts = max(self._collect_row_ts(row) for row in batch)
+            if cursor_mode and pages == 1 and page_max_local_id <= cursor \
+                    and page_max_ts > int(watermark_ts or 0):
+                # localId 回绕/重装：本地库行号已重置，旧游标不能再用
+                logger.warning("采集 %s 的 localId 游标失效（重装/回绕？），改用时间水位重采",
+                               session_id)
+                cursor_mode = False
+                cursor = 0
+                cursor_reset = True
+            new_in_page = 0
             for row in batch:
                 # 分页期间若有新消息插入，offset 可能使相邻页重复；按 rawid 去重
                 key = str(row.get("id") or row.get("localId") or "")
@@ -401,177 +352,251 @@ class AppService:
                     if key in seen:
                         continue
                     seen.add(key)
-                if self._catchup_row_ts(row) >= since_ts:
+                row_local_id = self._collect_row_local_id(row)
+                max_local_id = max(max_local_id, row_local_id)
+                if cursor_mode:
+                    keep = row_local_id > cursor or (
+                        row_local_id <= 0 and self._collect_row_ts(row) >= since_ts)
+                else:
+                    keep = self._collect_row_ts(row) >= since_ts
+                if keep:
                     rows.append(row)
+                    new_in_page += 1
             offset += len(batch)
-            oldest = min(self._catchup_row_ts(row) for row in batch)
-            if oldest < since_ts:
+            if cursor_mode and new_in_page == 0:
+                # 该页已全部是游标之前的历史：游标边界到了
+                break
+            oldest = min(self._collect_row_ts(row) for row in batch)
+            if oldest < floor:
                 break
             if len(rows) >= max_rows:
                 return {"ok": False, "rows": rows, "complete": False, "pages": pages,
-                        "error": f"backlog_over_limit:{len(rows)}"}
+                        "error": f"backlog_over_limit:{len(rows)}",
+                        "local_id": max_local_id, "cursor_reset": cursor_reset}
             if pages >= 400:
                 return {"ok": False, "rows": rows, "complete": False, "pages": pages,
-                        "error": "too_many_pages"}
+                        "error": "too_many_pages",
+                        "local_id": max_local_id, "cursor_reset": cursor_reset}
             # WCDA 正常会返回 hasMore；短页且明确没有更多时才认为历史到底
             if len(batch) < page_size and not page.get("has_more"):
                 break
-        rows.sort(key=self._catchup_row_ts)
-        return {"ok": True, "rows": rows, "complete": True, "pages": pages}
+        rows.sort(key=self._collect_row_ts)
+        return {"ok": True, "rows": rows, "complete": True, "pages": pages,
+                "local_id": max_local_id, "cursor_reset": cursor_reset}
 
-    def _catchup_chunks(self, messages: list[dict]) -> list[list[dict]]:
-        """按条数/字符数切批（时间升序）；批大小补采可单独配置，字符上限与实时账本一致。"""
-        settings = self.settings
-        max_messages = max(5, int(settings.wcda_catchup_batch_messages))
-        max_chars = max(500, int(settings.event_max_chars))
-        chunks: list[list[dict]] = []
-        current: list[dict] = []
-        chars = 0
-        for message in messages:
-            size = len(str(message.get("content") or ""))
-            if current and (len(current) >= max_messages or chars + size > max_chars):
-                chunks.append(current)
-                current = []
-                chars = 0
-            current.append(message)
-            chars += size
-        if current:
-            chunks.append(current)
-        return chunks
+    async def _wcda_alive(self) -> bool | None:
+        """探测 WCDA 是否在线（只在「没有监控会话」时用于解释 connected）。"""
+        checker = getattr(self.wcda, "check_health", None)
+        if not callable(checker):
+            return None
+        try:
+            return bool(await checker())
+        except Exception:  # noqa: BLE001 - 探测失败按未连接处理
+            return False
 
-    async def catchup(self, minutes: int | None = None,
+    async def collect(self, minutes: int | None = None,
                       session_ids: list[str] | None = None,
                       mode: str = "window") -> dict:
-        """按会话补采最近消息（仅由后台自动轮 / 新置顶回补调用）。
+        """采集入口：串行化各采集轮（周期轮 / 新置顶回补 / 深扫），避免共享的
+        同轮推送收集器被并发轮次互相覆盖。"""
+        async with self._collect_lock:
+            return await self._collect_round(
+                minutes=minutes, session_ids=session_ids, mode=mode)
 
-        - 不传 ``session_ids``：只补当前监控范围（置顶 + 白名单）；
-        - 传 ``session_ids``：内部回补指定会话（新置顶群）；
-        - ``mode="window"``：固定回看 ``minutes``（新置顶回补 / 启动额外回补）；
-        - ``mode="watermark"``：从每个会话上次补采水位继续，长时间离线后补齐全部未采集消息；
-          单轮最长回看 ``WCDA_CATCHUP_MAX_HOURS``，每轮最多处理
-          ``WCDA_CATCHUP_ROUND_BUDGET`` 条，未处理完的留在下一轮（水位按批推进）。
+    async def _collect_round(self, minutes: int | None = None,
+                             session_ids: list[str] | None = None,
+                             mode: str = "window") -> dict:
+        """采集：拉取会话消息 → 入库（processed=0）→ 按会话一次处理 → 标记 processed=1。
+
+        增量依据是**每会话 localId 游标**（WCDB 行序，与 createTime 解耦），用来兜住
+        「写入晚、业务时间旧」的晚到消息；首次建立游标（或 localId 失效）时退回时间水位。
+        每轮拿到消息后按会话一次性处理；单条消息处理失败最多重试
+        ``MESSAGE_MAX_ATTEMPTS`` 次，超限进「失败队列」并告警，不再阻塞同会话后续消息。
+
+        - 不传 ``session_ids``：采集当前监控范围（置顶 + 白名单），并兜底所有已入库未处理会话；
+        - 传 ``session_ids``：回补指定会话（新置顶群）；
+        - ``mode="window"``：固定回看 ``minutes``（新置顶回补 / 启动额外回补），不推进游标；
+        - ``mode="watermark"``：从每个会话的 localId 游标继续，单轮最长回看
+          ``WCDA_CATCHUP_MAX_HOURS``；每轮最多处理 ``WCDA_CATCHUP_ROUND_BUDGET`` 条，
+          未处理完的留在下一轮；
+        - 本轮新建的待办在轮末**合并成一条推送**（同轮合并推送），不再每个会话推一次。
         """
+        started = time.monotonic()
+        empty_result = {
+            "ok": False, "mode": "off", "minutes": 0, "sessions": 0, "inserted": 0,
+            "processed": 0, "scanned": 0, "pages": 0, "tasks_created": 0,
+            "tasks_updated": 0, "dropped_other": 0, "failed": 0, "dead_lettered": 0,
+            "budget_exhausted": False, "skipped": [], "pending": self.db.count_unprocessed(),
+            "failed_queue": self.db.count_failed_messages(), "at": now_iso(),
+        }
         if self.data_source != "wcda" or not self.wcda.configured:
-            return {"ok": False, "reason": "当前数据源不是 wcda", "inserted": 0, "sessions": 0,
-                    "minutes": 0, "tasks_created": 0, "tasks_updated": 0, "dropped_other": 0}
+            return {**empty_result, "reason": "当前数据源不是 wcda"}
+
         mode = "watermark" if str(mode or "").lower() in ("watermark", "all", "auto") else "window"
         # 只有水位模式才推进 catchup_state；window 模式只扫固定窗口，写水位会让
         # 后续 watermark 轮误以为空档已覆盖（P1：混合调用永久漏采）。
         advance = mode == "watermark"
         now_ts = int(time.time())
-        window_seconds = self._catchup_window_seconds(minutes, mode)
+        window_seconds = self._collection_window_seconds(minutes, mode)
         explicit = [str(item).strip() for item in (session_ids or []) if str(item).strip()]
+        source_unreachable = False
         if explicit:
             if not self._sessions_cache:
-                sessions = await self.wcda.fetch_sessions(limit=500)
-                self._sessions_cache = sessions
+                self._sessions_cache = await self.wcda.fetch_sessions(limit=500)
             known = {str(s.get("username")): str(s.get("name") or "") for s in self._sessions_cache}
             targets = [{"session_id": sid, "group_name": known.get(sid, "")} for sid in explicit]
         else:
             targets = await self._monitored_sessions()
+            if not targets:
+                alive = await self._wcda_alive()
+                if alive is False:
+                    source_unreachable = True
+                    self.connected = False
+                    self.last_error = "读取不到监控会话：WeChatDataAnalysis 未连接"
+            # 兜底：所有「已入库未处理」的会话都纳入本轮处理目标（不必重新拉取）。
+            # 即使数据源暂时不可达，也先把本地已入库未处理的消息处理掉。
+            known_ids = {str(item["session_id"]) for item in targets}
+            for pending_session in self.db.unprocessed_sessions():
+                session_id = str(pending_session["session_id"])
+                if session_id and session_id not in known_ids:
+                    targets.append({
+                        "session_id": session_id,
+                        "group_name": str(pending_session.get("group_name") or ""),
+                        "fallback_only": True,
+                    })
+            if not targets:
+                at = now_iso()
+                if source_unreachable:
+                    failed = {**empty_result, "mode": mode,
+                              "minutes": int(round(window_seconds / 60)),
+                              "reason": self.last_error, "at": at}
+                    self._last_collection = failed
+                    self._last_collect_at = at
+                    return failed
+                # 数据源可达但当前没有要采集/要兜底的会话：视为一次成功的空轮
+                empty_ok = {**empty_result, "ok": True, "mode": mode,
+                            "minutes": int(round(window_seconds / 60)), "at": at}
+                self._last_collection = empty_ok
+                self._last_collect_at = at
+                self._last_collect_ok_at = at
+                self.connected = True
+                self.last_error = None
+                return empty_ok
 
-        budget = max(0, int(self.settings.wcda_catchup_round_budget))
+        settings = self.settings
+        budget = max(0, int(settings.wcda_catchup_round_budget))
         used_budget = 0
         budget_exhausted = False
-        inserted_total = sessions_touched = created_total = updated_total = dropped_total = 0
-        scanned_total = pages_total = 0
+        inserted_total = processed_total = sessions_touched = 0
+        created_total = updated_total = dropped_total = 0
+        scanned_total = pages_total = failures = 0
+        dead_lettered: list[dict] = []
         skipped: list[str] = []
-        for target in targets[:60]:
-            if budget and used_budget >= budget:
-                budget_exhausted = True
-                break
-            session_id = target["session_id"]
-            since_ts = self._catchup_since_ts(session_id, mode=mode,
-                                              window_seconds=window_seconds, now_ts=now_ts)
-            fetched = await self._fetch_catchup_rows(session_id, since_ts)
-            pages_total += int(fetched.get("pages") or 0)
-            if not fetched.get("ok"):
-                skipped.append(session_id)
-                logger.warning("补采 %s 读取失败/积压过大，留到下一轮：%s",
-                               target["group_name"] or session_id, fetched.get("error"))
-                continue
-            rows = fetched.get("rows") or []
-            scanned_total += len(rows)
-            if not rows:
-                # 本轮扫到 now，前移水位，避免下一轮重复回溯（仅水位模式）
-                if advance:
-                    self.db.set_catchup_state(session_id, max(now_ts, since_ts))
-                continue
-            converted: list[dict] = []
-            for row in rows:
-                try:
-                    item = WcdaClient.convert_api_message(
-                        session_id, target["group_name"], row, self.wcda.account)
-                except (TypeError, ValueError):  # 单条脏数据不让整轮失败
-                    continue
-                if item:
-                    converted.append(item)
-            if not converted:
-                if advance:
-                    self.db.set_catchup_state(session_id, max(now_ts, since_ts))
-                continue
-            existing = set() if explicit else self.db.existing_message_ids(
-                list({str(item.get("rawid") or "") for item in converted}))
-            processable = [
-                item for item in converted
-                if explicit or str(item.get("rawid") or "") not in existing
-            ]
-            if not processable:
-                if advance:
-                    self.db.set_catchup_state(session_id, max(now_ts, since_ts))
-                continue
-
-            inserted = 0
-            touched = False
-            processed_in_session = 0
-            session_created = 0
-            for chunk in self._catchup_chunks(processable):
+        # 同轮合并推送：本轮内新建的待办先收集，轮末合并成一条推送
+        self._round_push = {"tasks": [], "summaries": []}
+        collector: dict | None = None
+        try:
+            for target in targets:
                 if budget and used_budget >= budget:
                     budget_exhausted = True
                     break
+                session_id = str(target["session_id"])
+                group_name = str(target.get("group_name") or "")
+                label = group_name or session_id
+                fetched: dict = {}
+                since_ts = now_ts - window_seconds
+                if not target.get("fallback_only"):
+                    state = self.db.get_catchup_state(session_id) or {}
+                    cursor = int(state.get("last_local_id") or 0) if advance else 0
+                    watermark_ts = int(state.get("last_ts") or 0)
+                    since_ts = self._collection_since_ts(
+                        session_id, mode=mode, window_seconds=window_seconds, now_ts=now_ts)
+                    floor_ts = None
+                    if cursor > 0:
+                        # 游标模式：允许为找「晚到消息」翻到 MAX_HOURS 之前；时间窗只用于无 localId 行
+                        floor_ts = now_ts - max(1, int(settings.wcda_catchup_max_hours)) * 3600
+                    fetched = await self._fetch_collect_rows(
+                        session_id, since_ts, cursor=cursor,
+                        watermark_ts=watermark_ts, floor_ts=floor_ts)
+                    pages_total += int(fetched.get("pages") or 0)
+                    if not fetched.get("ok"):
+                        skipped.append(session_id)
+                        failures += 1
+                        logger.warning("采集 %s 读取失败/积压过大，留到下一轮：%s",
+                                       label, fetched.get("error"))
+                    else:
+                        rows = fetched.get("rows") or []
+                        scanned_total += len(rows)
+                        converted: list[dict] = []
+                        for row in rows:
+                            try:
+                                item = WcdaClient.convert_api_message(
+                                    session_id, group_name, row, self.wcda.account)
+                            except (TypeError, ValueError):  # 单条脏数据不让整轮失败
+                                continue
+                            if item:
+                                converted.append(item)
+                        # existing_message_ids 只跳过已终结（processed=1/2）的消息；
+                        # processed=0 的消息要重新处理
+                        processed_ids = self.db.existing_message_ids(
+                            list({str(item.get("rawid") or "") for item in converted}))
+                        fresh = [item for item in converted
+                                 if str(item.get("rawid") or "") not in processed_ids]
+                        if fresh:
+                            try:
+                                inserted_total += self.db.add_messages(fresh)
+                            except Exception as error:  # noqa: BLE001 - 入库失败保留游标，下轮重试
+                                failures += 1
+                                skipped.append(session_id)
+                                logger.warning("采集 %s 入库失败，保留游标下轮重试：%s", label, error)
+                                continue
+                            self.last_event_at = now_iso()
+                        # 拉取成功后即推进游标：消息已经持久化，处理失败交给 DB 的未处理兜底
+                        if advance:
+                            self.db.set_catchup_state(
+                                session_id, max(now_ts, since_ts),
+                                fetched.get("local_id") or None,
+                                reset_local_id=bool(fetched.get("cursor_reset")))
+
+                remaining = (budget - used_budget) if budget else 0
+                pending = self.db.unprocessed_messages(
+                    session_id, limit=(remaining + 1) if budget else 0)
+                if budget and len(pending) > remaining:
+                    budget_exhausted = True
+                    pending = pending[:remaining]
+                if not pending:
+                    continue
                 if explicit:
                     self._force_allow_sessions.add(session_id)
                 try:
-                    stats = await self.process_batch(chunk)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:  # noqa: BLE001 - 单批失败不拖垮其余会话
-                    logger.warning("补采归纳失败（%s），留到下一轮：%s",
-                                   target["group_name"] or session_id, error)
-                    break
+                    outcome = await self._process_pending_messages(session_id, pending)
                 finally:
                     if explicit:
                         self._force_allow_sessions.discard(session_id)
-                touched = True
-                session_created += stats.get("tasks_created", 0)
-                created_total += stats.get("tasks_created", 0)
-                updated_total += stats.get("tasks_updated", 0)
-                dropped_total += stats.get("dropped_other", 0)
-                # 先归纳、再落库：归纳失败时消息不会入库，下一轮还能重新处理
-                for item in chunk:
-                    if self.db.add_message(
-                        rawid=str(item.get("rawid") or ""), session_id=session_id,
-                        group_name=str(item.get("group_name") or target["group_name"]),
-                        sender=str(item.get("sender") or ""),
-                        content=str(item.get("content") or ""),
-                        ts=int(item.get("ts") or 0),
-                    ):
-                        inserted += 1
-                processed_in_session += len(chunk)
-                used_budget += len(chunk)
-                newest_ts = max(int(item.get("ts") or 0) for item in chunk)
-                if advance:
-                    self.db.set_catchup_state(session_id, newest_ts)
-            if touched:
-                sessions_touched += 1
-                inserted_total += inserted
-                logger.info("补采 %s：%s 条消息，新增 %s 项待办",
-                            target["group_name"] or session_id, processed_in_session,
-                            session_created)
-                if advance and processed_in_session >= len(processable) and not budget_exhausted:
-                    self.db.set_catchup_state(session_id, now_ts)
-            if budget_exhausted:
-                break
+                processed_total += outcome["processed"]
+                used_budget += outcome["processed"]
+                dead_lettered.extend(outcome["dead"])
+                if outcome.get("failed"):
+                    # 处理失败（含整体性故障）也要体现在采集健康状态里，
+                    # 否则 health 只剩 pending 增长、last_error 永远为空
+                    failures += 1
+                if outcome["processed"]:
+                    sessions_touched += 1
+                created_total += outcome["tasks_created"]
+                updated_total += outcome["tasks_updated"]
+                dropped_total += outcome["dropped_other"]
+                if outcome["processed"] and (
+                        outcome["tasks_created"] or outcome["tasks_updated"]):
+                    logger.info("采集 %s：处理 %s 条消息，新建 %s 项待办、更新 %s 项",
+                                label, outcome["processed"], outcome["tasks_created"],
+                                outcome["tasks_updated"])
+                elif outcome["processed"]:
+                    logger.info("采集 %s：处理 %s 条消息，未产生新待办", label, outcome["processed"])
+                if budget_exhausted:
+                    break
+        finally:
+            collector = self._round_push
+            self._round_push = None
 
         result = {
             "ok": True,
@@ -579,114 +604,192 @@ class AppService:
             "minutes": int(round(window_seconds / 60)),
             "sessions": sessions_touched,
             "inserted": inserted_total,
+            "processed": processed_total,
             "scanned": scanned_total,
             "pages": pages_total,
             "tasks_created": created_total,
             "tasks_updated": updated_total,
             "dropped_other": dropped_total,
+            "failed": len(dead_lettered),
+            "dead_lettered": len(dead_lettered),
             "budget_exhausted": budget_exhausted,
             "skipped": skipped[:20],
+            "pending": self.db.count_unprocessed(),
+            "failed_queue": self.db.count_failed_messages(),
+            "duration_ms": int((time.monotonic() - started) * 1000),
             "at": now_iso(),
         }
-        self._last_catchup = result
-        if inserted_total:
-            logger.info("补采完成（%s）：%s 个会话、%s 条消息、新增 %s 项待办",
-                        mode, sessions_touched, inserted_total, created_total)
+        self._last_collection = result
+        self._last_collect_at = result["at"]
+        if source_unreachable:
+            # 数据源不可达：本地未处理消息仍然已经处理，但 connected/ok 如实标记失败
+            result["ok"] = False
+            result["reason"] = self.last_error or "WeChatDataAnalysis 未连接"
+            self.connected = False
+        else:
+            # 只要采集轮能跑完就说明数据源可达（个别会话读取/处理失败记录到 last_error）
+            self.connected = True
+            if failures == 0:
+                self._last_collect_ok_at = result["at"]
+                self.last_error = None
+            else:
+                self.last_error = f"采集完成，但 {failures} 个会话失败（详见日志）"
+        # 同轮合并推送：本轮所有新建待办只发一条推送
+        if collector is not None:
+            try:
+                await self._flush_round_push(collector)
+            except Exception as error:  # noqa: BLE001 - 推送失败不影响采集结果
+                logger.warning("同轮合并推送失败：%s", error)
+        # 处理失败重试超限：落失败队列并告警（不受免打扰限制）
+        if dead_lettered:
+            await self._alert_failed_messages(dead_lettered)
+        logger.info("采集完成（%s）：会话 %s、扫描 %s、新增消息 %s、处理 %s、"
+                    "新建待办 %s、更新 %s、失败入队 %s、分页 %s、待处理 %s、耗时 %sms%s",
+                    mode, result["sessions"], result["scanned"], result["inserted"],
+                    result["processed"], result["tasks_created"], result["tasks_updated"],
+                    result["dead_lettered"], result["pages"], result["pending"],
+                    result["duration_ms"],
+                    "（预算用完，余量下轮继续）" if budget_exhausted else "")
         return result
 
-    async def _catchup_loop(self) -> None:
+    async def catchup(self, minutes: int | None = None,
+                      session_ids: list[str] | None = None,
+                      mode: str = "window") -> dict:
+        """已废弃：保留给历史脚本/旧调用，等价于 :meth:`collect`。"""
+        return await self.collect(minutes=minutes, session_ids=session_ids, mode=mode)
+
+    async def _collect_loop(self) -> None:
         settings = self.settings
-        await asyncio.sleep(8)  # 等实时流先建立
+        await asyncio.sleep(8)  # 等服务启动完成再首轮采集
         try:
-            # 先按会话水位补停机/断网期间的空档；配置了启动回补窗口时再额外按窗口补一次
-            await self.catchup(mode="watermark")
+            # 先按 localId 游标采停机/断网期间的空档；配置了启动回补窗口时再额外按窗口采一次
+            await self.collect(mode="watermark")
             if settings.wcda_catchup_on_start_minutes > 0:
-                await self.catchup(minutes=settings.wcda_catchup_on_start_minutes, mode="window")
+                await self.collect(minutes=settings.wcda_catchup_on_start_minutes, mode="window")
         except asyncio.CancelledError:
             raise
-        except Exception as error:  # noqa: BLE001 - 补采失败不影响实时流
-            logger.warning("启动补采失败：%s", error)
+        except Exception as error:  # noqa: BLE001 - 采集失败不阻塞服务
+            self._record_collect_failure(error)
+            logger.warning("启动采集失败：%s", error)
         interval = settings.wcda_catchup_seconds
         if interval <= 0:
             return
         while True:
             await asyncio.sleep(interval)
             try:
-                await self.catchup(mode="watermark")
+                await self.collect(mode="watermark")
+                await self._maybe_deep_scan()
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # noqa: BLE001
-                logger.warning("补采失败：%s", error)
+                self._record_collect_failure(error)
+                logger.warning("采集失败：%s", error)
 
-    def _catchup_enabled(self) -> bool:
+    def _deep_scan_due(self) -> bool:
+        minutes = int(self.settings.wcda_deep_scan_minutes)
+        if minutes <= 0:
+            return False
+        return time.monotonic() - self._last_deep_scan_at >= minutes * 60
+
+    async def _maybe_deep_scan(self) -> dict | None:
+        """晚到消息兜底深扫：按时间窗重扫一批，补上 localId 游标扫描深度之外的旧 ts 消息。
+
+        WCDA 的 /api/chat/messages 按 createTime 排序、且没有 localId 过滤参数，所以
+        「写入晚、业务时间旧」的消息可能落在游标快速扫描的深度之外（见
+        docs/API.md「采集」）。深扫不推进 localId 游标，只做时间窗重扫 + rawid 去重，
+        因此不会重复建待办，也不会把游标推错。
+        """
+        if not self._deep_scan_due():
+            return None
+        self._last_deep_scan_at = time.monotonic()
+        minutes = max(30, int(self.settings.wcda_deep_scan_lookback_minutes))
+        logger.info("开始晚到消息深扫：回看 %s 分钟（不影响 localId 游标）", minutes)
+        try:
+            result = await self.collect(minutes=minutes, mode="window")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - 深扫失败不影响主采集轮
+            logger.warning("晚到消息深扫失败：%s", error)
+            return None
+        logger.info("晚到消息深扫完成：扫描 %s、新增 %s、处理 %s、新建待办 %s",
+                    result.get("scanned"), result.get("inserted"),
+                    result.get("processed"), result.get("tasks_created"))
+        result["deep_scan"] = True
+        return result
+
+    def _record_collect_failure(self, error: Exception, mode: str = "watermark") -> None:
+        """把失败轮写进采集快照，设置页「上次采集失败」和排障都能看到原因。"""
+        self.connected = False
+        self.last_error = f"{type(error).__name__}: {error}"[:300]
+        at = now_iso()
+        self._last_collection = {
+            "ok": False, "mode": mode, "minutes": 0, "sessions": 0, "inserted": 0,
+            "processed": 0, "scanned": 0, "pages": 0, "tasks_created": 0,
+            "tasks_updated": 0, "dropped_other": 0, "failed": 0, "dead_lettered": 0,
+            "budget_exhausted": False, "skipped": [],
+            "pending": self.db.count_unprocessed(),
+            "failed_queue": self.db.count_failed_messages(), "at": at,
+            "reason": self.last_error,
+        }
+        self._last_collect_at = at
+
+    def _collect_enabled(self) -> bool:
         return bool(self.data_source == "wcda" and self.wcda.configured
                     and (self.settings.wcda_catchup_seconds > 0
                          or self.settings.wcda_catchup_on_start_minutes > 0))
 
-    def catchup_state(self) -> dict:
-        """补采水位/参数快照（设置页与排障用；states 最多返回最近 200 个会话）。"""
+    def collection_state(self) -> dict:
+        """采集游标/参数快照（设置页与排障用；states 最多返回最近 200 个会话）。"""
         settings = self.settings
         states = self.db.catchup_states()
         return {
-            "mode": "watermark" if self._catchup_enabled() else "off",
+            "mode": "watermark" if self._collect_enabled() else "off",
+            "seconds": settings.wcda_catchup_seconds,
+            "lookback_minutes": settings.wcda_catchup_lookback_minutes,
+            "backfill_minutes": settings.wcda_catchup_on_start_minutes,
             "max_hours": settings.wcda_catchup_max_hours,
             "page_size": settings.wcda_catchup_page_size,
             "round_budget": settings.wcda_catchup_round_budget,
             "empty_history_hours": settings.wcda_catchup_empty_history_hours,
+            "overlap_seconds": settings.wcda_catchup_overlap_seconds,
+            "deep_scan_minutes": settings.wcda_deep_scan_minutes,
+            "deep_scan_lookback_minutes": settings.wcda_deep_scan_lookback_minutes,
+            "max_attempts": settings.message_max_attempts,
             "watermark_sessions": len(states),
+            "cursor_sessions": sum(1 for item in states if int(item.get("last_local_id") or 0) > 0),
+            "pending_messages": self.db.count_unprocessed(),
+            "pending_sessions": len(self.db.unprocessed_sessions()),
+            "failed_messages": self.db.count_failed_messages(),
+            "failed_sessions": len(self.db.failed_sessions()),
+            "last_ok_at": self._last_collect_ok_at,
             "states": states[-200:],
-            "last": self._last_catchup,
+            "last": self._last_collection,
         }
 
+    def catchup_state(self) -> dict:
+        """兼容旧调用：等价于 :meth:`collection_state`。"""
+        return self.collection_state()
+
+    # ---------- 失败队列 ----------
+    def failed_queue(self, limit: int = 100, offset: int = 0) -> dict:
+        """失败队列快照：重试超限的消息（不再自动重试，等人工处理）。"""
+        items = self.db.failed_messages(limit=limit, offset=offset)
+        return {
+            "failed": items,
+            "count": self.db.count_failed_messages(),
+            "sessions": self.db.failed_sessions(),
+            "max_attempts": self.settings.message_max_attempts,
+        }
+
+    def retry_failed(self, rawids: list[str] | None = None, limit: int = 500) -> dict:
+        """把失败队列消息放回待处理（下一轮采集轮会自动重试）。"""
+        requeued = self.db.requeue_failed_messages(rawids, limit=limit)
+        if requeued:
+            logger.info("失败队列重试：%s 条消息放回待处理", requeued)
+        return {"ok": True, "requeued": requeued,
+                "remaining": self.db.count_failed_messages()}
+
     # ---------- 事件账本 ----------
-    def _buffer_message(self, message: dict) -> None:
-        session_id = str(message.get("session_id") or "")
-        if not session_id:
-            return
-        now = time.monotonic()
-        self.session_buffers.setdefault(session_id, []).append(message)
-        self.session_first_at.setdefault(session_id, now)
-        self.session_last_at[session_id] = now
-        self.session_group[session_id] = message.get("group_name", "")
-
-    async def _event_loop(self) -> None:
-        while True:
-            try:
-                await asyncio.sleep(1)
-                now = time.monotonic()
-                ready: list[str] = []
-                for session_id, messages in list(self.session_buffers.items()):
-                    if not messages:
-                        continue
-                    idle = now - self.session_last_at.get(session_id, now)
-                    age = now - self.session_first_at.get(session_id, now)
-                    chars = sum(len(str(m.get("content") or "")) for m in messages)
-                    if (idle >= self.settings.event_idle_seconds
-                            or age >= self.settings.event_max_wait_seconds
-                            or len(messages) >= self.settings.event_max_messages
-                            or chars >= self.settings.event_max_chars):
-                        ready.append(session_id)
-                for session_id in ready:
-                    messages = self.session_buffers.pop(session_id, [])
-                    self.session_first_at.pop(session_id, None)
-                    self.session_last_at.pop(session_id, None)
-                    if messages:
-                        await self._process_session_batch(session_id, messages)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                logger.exception("事件批次处理失败：%s", error)
-                await asyncio.sleep(2)
-
-    def _is_new_message(self, message: dict) -> bool:
-        if not self.settings.only_new_messages:
-            return True
-        try:
-            ts = int(message.get("ts") or 0)
-        except (TypeError, ValueError):
-            ts = 0
-        return not ts or ts >= self.started_ts - 120
-
     def _matches_custom(self, message: dict) -> bool:
         whitelist = self.settings.group_whitelist
         if not whitelist:
@@ -722,6 +825,173 @@ class AppService:
                 return True
             return pinned or custom
         return True
+
+    # ---------- 失败重试 / 失败队列 ----------
+    async def _process_pending_messages(self, session_id: str,
+                                        pending: list[dict]) -> dict:
+        """处理单个会话的待处理消息，失败时按条隔离、按次重试，超限落失败队列。
+
+        设计要点（不阻塞同会话后续消息）：
+        1. 整批处理成功 → 全部标记 processed=1；
+        2. 整批失败 → 逐条隔离重试，能单独处理成功的消息立即标记已处理，只有真正
+           失败的那条累积 attempts；
+        3. 待处理超过 ``_ISOLATE_LIMIT`` 条时，先隔离探测前 N 条：若探测样本**全部**
+           失败，更像 LLM/网络等整体性故障，本轮只记 last_error、不计 attempts，
+           避免一次短时故障把整批积压打进失败队列；只要样本里有成功的，就按正常
+           毒消息逻辑计 attempts（多轮后大积压会被逐批排空）；
+        4. attempts 达到 ``MESSAGE_MAX_ATTEMPTS`` → 置 processed=2（失败队列）并返回
+           告警明细，下一轮不再自动重试，同会话后续消息继续正常处理。
+
+        返回 ``{"processed", "dead", "failed", "tasks_created", "tasks_updated",
+        "dropped_other"}``；``failed`` 是本轮失败的消息条数（用于采集健康状态 last_error）。
+        """
+        max_attempts = max(1, int(self.settings.message_max_attempts))
+        outcome = {"processed": 0, "dead": [], "tasks_created": 0,
+                   "tasks_updated": 0, "dropped_other": 0, "failed": 0}
+        by_id = {str(item.get("rawid") or ""): item for item in pending}
+        try:
+            stats = await self.process_batch(pending)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - 单条毒消息隔离，不拖垮整轮
+            if len(pending) <= self._ISOLATE_LIMIT:
+                logger.warning("采集处理失败（%s，%s 条），逐条隔离重试：%s",
+                               session_id, len(pending), error)
+                failed_items = await self._isolate_messages(pending, outcome)
+                self._record_failure_attempts(failed_items, by_id, max_attempts, outcome)
+                outcome["failed"] = len(failed_items)
+                self._global_failure_streaks.pop(session_id, None)
+                return outcome
+            # 大积压：先隔离探测前 N 条，区分「整体性故障」与「个别毒消息」
+            probe = pending[: self._ISOLATE_LIMIT]
+            logger.warning("采集处理失败（%s，%s 条，先隔离探测 %s 条）：%s",
+                           session_id, len(pending), len(probe), error)
+            failed_items = await self._isolate_messages(probe, outcome)
+            if failed_items and outcome["processed"] == 0:
+                # 探测样本全部失败 → 更像整体性故障：不计 attempts，只记 last_error
+                self.db.record_message_errors(
+                    [str(item.get("rawid") or "") for item in pending],
+                    f"{type(error).__name__}: {error}"[:300])
+                streak = self._global_failure_streaks.get(session_id, 0) + 1
+                self._global_failure_streaks[session_id] = streak
+                outcome["failed"] = len(pending)
+                if streak == 3 or streak % 10 == 0:
+                    logger.warning("采集持续处理失败（%s，连续 %s 轮），升级告警：%s",
+                                   session_id, streak, error)
+                    await self._alert_sustained_failure(session_id, streak, len(pending), error)
+                else:
+                    logger.warning("采集处理整体性失败（%s），本轮不计重试次数，保留待处理：%s",
+                                   session_id, error)
+                return outcome
+            self._record_failure_attempts(failed_items, by_id, max_attempts, outcome)
+            outcome["failed"] = len(failed_items)
+            if outcome["processed"]:
+                self._global_failure_streaks.pop(session_id, None)
+            return outcome
+
+        # 整批成功（含被过滤/判为他人）→ 标记已处理
+        self._global_failure_streaks.pop(session_id, None)
+        self.db.mark_messages_processed([str(item.get("rawid") or "") for item in pending])
+        outcome["processed"] = len(pending)
+        outcome["tasks_created"] = int(stats.get("tasks_created", 0))
+        outcome["tasks_updated"] = int(stats.get("tasks_updated", 0))
+        outcome["dropped_other"] = int(stats.get("dropped_other", 0))
+        return outcome
+
+    async def _isolate_messages(self, messages: list[dict],
+                                outcome: dict) -> list[tuple[dict, Exception]]:
+        """逐条重试一批消息：成功的立即标记 processed=1，返回真正失败的消息+异常。"""
+        failed: list[tuple[dict, Exception]] = []
+        for message in messages:
+            try:
+                single = await self.process_batch([message])
+            except asyncio.CancelledError:
+                raise
+            except Exception as single_error:  # noqa: BLE001
+                failed.append((message, single_error))
+                continue
+            outcome["processed"] += 1
+            outcome["tasks_created"] += int(single.get("tasks_created", 0))
+            outcome["tasks_updated"] += int(single.get("tasks_updated", 0))
+            outcome["dropped_other"] += int(single.get("dropped_other", 0))
+            self.db.mark_messages_processed([str(message.get("rawid") or "")])
+        return failed
+
+    def _record_failure_attempts(self, failed_items: list[tuple[dict, Exception]],
+                                 by_id: dict[str, dict], max_attempts: int,
+                                 outcome: dict) -> None:
+        """为隔离后仍失败的消息累计 attempts，并把超限的放入失败队列（告警明细）。"""
+        for message, failure in failed_items:
+            rawid = str(message.get("rawid") or "")
+            if not rawid:
+                continue
+            detail = self.db.record_message_failures(
+                [rawid], f"{type(failure).__name__}: {failure}"[:300], max_attempts)
+            outcome["dead"].extend(self._dead_letter_items(
+                detail.get("dead") or [], by_id, failure))
+
+    @staticmethod
+    def _dead_letter_items(rawids: list[str], by_id: dict[str, dict],
+                           error: Exception) -> list[dict]:
+        """组装告警明细：哪条消息、哪个群、什么错误、重试了几次。"""
+        items: list[dict] = []
+        for rawid in rawids:
+            message = by_id.get(rawid) or {}
+            items.append({
+                "rawid": rawid,
+                "group_name": str(message.get("group_name") or ""),
+                "sender": str(message.get("sender") or ""),
+                "content": str(message.get("content") or ""),
+                "error": f"{type(error).__name__}: {error}"[:200],
+            })
+        return items
+
+    async def _alert_failed_messages(self, items: list[dict]) -> None:
+        """失败队列告警：一条汇总推送（不受免打扰限制），并在日志里写明原因。"""
+        if not items:
+            return
+        title = f"微信待办 · {len(items)} 条消息处理失败"
+        lines: list[str] = []
+        for item in items[:5]:
+            meta = " · ".join(part for part in (
+                clip(item.get("group_name") or "", 20),
+                clip(item.get("sender") or "", 20),
+            ) if part)
+            text = clip(item.get("content") or "", 60) or item.get("rawid") or ""
+            lines.append(f"• {text}" + (f"（{meta}）" if meta else ""))
+        if len(items) > 5:
+            lines.append(f"…共 {len(items)} 条")
+        lines.append(f"已重试 {self.settings.message_max_attempts} 次仍失败，已移入失败队列，"
+                     f"不影响同会话后续消息；可在设置页「运行状态 → 采集」查看并重试。")
+        body = "\n".join(lines)[:480]
+        logger.error("消息处理失败已进入失败队列（%s 条）：%s", len(items),
+                     "；".join(f"{clip(item.get('content') or '', 30)} <- {item.get('error')}"
+                               for item in items[:5]))
+        try:
+            await self._notify(title, body, priority="high", bypass_quiet=True)
+        except Exception as error:  # noqa: BLE001 - 告警失败不影响采集/入库
+            logger.warning("失败队列告警推送失败：%s", error)
+
+    async def _alert_sustained_failure(self, session_id: str, streak: int,
+                                       pending: int, error: Exception) -> None:
+        """连续多轮整体性处理失败时的升级告警。
+
+        大积压 + 探测样本全部失败时按「整体性故障」处理（不消耗重试次数、不进失败队列），
+        但若连续多轮仍不恢复，可能是一次长期故障，也可能是一批每条都失败的畸形消息：
+        推送一条告警让用户尽早介入（检查数据源/日志，或在修复后重试失败队列）。
+        """
+        group = str(self.pinned_names.get(session_id) or session_id)
+        body = (f"采集连续 {streak} 轮处理失败（会话 {clip(group, 30)}，待处理 {pending} 条）。\n"
+                f"可能为整体性故障（大模型/网络/数据源），也可能是这批消息本身有问题。\n"
+                f"未消耗重试次数、未进失败队列，恢复后会自动继续；请检查日志与数据源。\n"
+                f"最近错误：{type(error).__name__}: {clip(str(error), 120)}")[:480]
+        logger.error("采集连续 %s 轮整体性失败（%s，待处理 %s 条）：%s",
+                     streak, session_id, pending, error)
+        try:
+            await self._notify("微信待办 · 采集持续失败", body, priority="high",
+                               bypass_quiet=True)
+        except Exception as alert_error:  # noqa: BLE001 - 告警失败不影响采集/入库
+            logger.warning("采集持续失败告警推送失败：%s", alert_error)
 
     async def _identity_for(self, session_id: str, group_name: str,
                             is_group: bool) -> IdentityContext:
@@ -826,8 +1096,7 @@ class AppService:
         return payload
 
     async def _process_session_batch(self, session_id: str, messages: list[dict]) -> dict:
-        group_name = self.session_group.get(session_id) or (
-            messages[-1].get("group_name") if messages else "") or ""
+        group_name = (messages[-1].get("group_name") if messages else "") or ""
         is_group = bool(messages[-1].get("is_group", True)) if messages else True
         identity = await self._identity_for(session_id, group_name, is_group)
         filtered, dropped_other = self._filter_messages(messages, identity)
@@ -842,9 +1111,9 @@ class AppService:
             open_events = self._open_events_payload(session_id)
             result = await llm_reconcile(filtered, open_events, self.settings, now, identity=identity)
             if result is not None:
-                supplemented = await self._merge_into_manual_tasks(filtered, result, now)
+                merge_stats = await self._merge_into_manual_tasks(filtered, result, now)
                 stats = await self._apply_reconcile(session_id, group_name, filtered, last_ts, result)
-                stats["supplemented"] = supplemented
+                stats.update(merge_stats)
                 stats["dropped_other"] = dropped_other
                 return stats
 
@@ -928,39 +1197,61 @@ class AppService:
             "events": events_touched, "mode": "llm", "summary": result.summary,
         }
 
-    # ---------- 手动待办：新建去重 / 自动补充 ----------
+    # ---------- 手动待办：新建去重 / 自动补充 / 已忽略去重 ----------
     async def _merge_into_manual_tasks(self, messages: list[dict], result: ReconcileResult,
-                                       now) -> int:
-        """模型总结出新待办后，与手动待办比对：几乎相同 → 补充；部分相同 → 补充 + 拆分。
+                                       now) -> dict:
+        """模型总结出新待办后，与手动待办比对：
+
+        - 未完成的手动待办：几乎相同 → 补充（split 时剩余部分另建）；
+        - 最近 MANUAL_SUPPRESS_DAYS 天内被忽略的手动待办：同一件事 → 丢弃新待办（suppress）；
+        - 都不匹配 → 照常新建。
 
         底线（与用户约定）：手动待办的标题、已有截止时间、已有备注一律不改；
-        只补它目前为空的字段，并追加来源消息便于追溯。
-        返回本次补充到的手动待办条数。
+        只补它目前为空的字段，并追加来源消息便于追溯；已忽略的待办只用于抑制重复，
+        本身不被改写。返回 {"supplemented": n, "suppressed": m}。
         """
+        stats = {"supplemented": 0, "suppressed": 0}
         candidates: list[tuple[int, int, ReconcileTask]] = []
         for item_index, item in enumerate(result.items):
             for task_index, task in enumerate(item.tasks):
                 if not task.task_id:  # 只判定「新建」的待办；更新已有任务不动
                     candidates.append((item_index, task_index, task))
         if not candidates:
-            return 0
+            return stats
         manual_tasks = self.db.list_manual_pending(limit=20)
-        if not manual_tasks:
-            return 0
+        suppress_days = max(0, int(getattr(self.settings, "manual_suppress_days", 0) or 0))
+        ignored_tasks: list[dict] = []
+        if suppress_days > 0:
+            cutoff = to_iso(now - timedelta(days=suppress_days))
+            ignored_tasks = self.db.list_manual_ignored(cutoff, limit=20)
+        if not manual_tasks and not ignored_tasks:
+            return stats
         decisions = await llm_match_manual(
             [task for _item, _task, task in candidates], manual_tasks, messages,
-            self.settings, now,
+            self.settings, now, ignored_tasks=ignored_tasks,
         )
         if not decisions:
-            return 0
+            return stats
 
         manual_by_id = {str(task.get("id")): task for task in manual_tasks}
+        ignored_by_id = {str(task.get("id")): task for task in ignored_tasks}
         dropped: set[tuple[int, int]] = set()
         supplemented_ids: set[str] = set()
+        suppressed = 0
         for decision in decisions:
             if not 0 <= decision.index < len(candidates):
                 continue
             item_index, task_index, task = candidates[decision.index]
+            if decision.relation == "suppress":
+                ignored = ignored_by_id.get(decision.manual_task_id or "")
+                if ignored is None:
+                    continue
+                dropped.add((item_index, task_index))
+                suppressed += 1
+                logger.info("已忽略去重：跳过新建「%s」（对应已忽略待办「%s」，窗口 %s 天）",
+                            clip(task.title or "", 30),
+                            clip(ignored.get("title") or "", 30), suppress_days)
+                continue
             manual = manual_by_id.get(decision.manual_task_id or "")
             if decision.relation in ("same", "split") and manual is None:
                 continue
@@ -984,7 +1275,7 @@ class AppService:
             for item_index, item in enumerate(result.items):
                 item.tasks = [task for task_index, task in enumerate(item.tasks)
                               if (item_index, task_index) not in dropped]
-                # 新事项的任务全被并进手动待办时，不再建一条空事项
+                # 新事项的任务全被并进手动待办 / 抑制掉时，不再建一条空事项
                 if item.tasks or item.event_id:
                     kept_items.append(item)
             result.items = kept_items
@@ -994,7 +1285,9 @@ class AppService:
                 "手动待办自动补充 %s 条（本轮新建待办 %s 条参与判定，并入后跳过新建 %s 条）",
                 len(supplemented_ids), len(candidates), len(dropped),
             )
-        return len(supplemented_ids)
+        stats["supplemented"] = len(supplemented_ids)
+        stats["suppressed"] = suppressed
+        return stats
 
     def _supplement_manual(self, manual: dict, candidate: ReconcileTask, decision,
                            *, include_candidate: bool) -> None:
@@ -1057,6 +1350,7 @@ class AppService:
         for message in messages:
             groups.setdefault(str(message.get("session_id") or ""), []).append(message)
         total_created = total_updated = total_kept = total_dropped = total_supplemented = 0
+        total_suppressed = 0
         last_mode = "rule"
         last_summary = ""
         for session_id, session_messages in groups.items():
@@ -1068,11 +1362,12 @@ class AppService:
             total_kept += stats.get("kept", 0)
             total_dropped += stats.get("dropped_other", 0)
             total_supplemented += stats.get("supplemented", 0)
+            total_suppressed += stats.get("suppressed", 0)
             last_mode = stats.get("mode", last_mode)
             last_summary = stats.get("summary", last_summary)
         return {"messages": len(messages), "kept": total_kept,
                 "tasks_created": total_created, "tasks_updated": total_updated,
-                "supplemented": total_supplemented,
+                "supplemented": total_supplemented, "suppressed": total_suppressed,
                 "dropped_other": total_dropped,
                 "mode": last_mode, "summary": last_summary}
 
@@ -1081,8 +1376,10 @@ class AppService:
     def app_url(self) -> str:
         return f"{self.settings.base_url}/?token={quote(self.settings.app_token)}"
 
-    async def _notify(self, title: str, body: str, priority: str = "normal") -> list[dict]:
-        if in_quiet_hours(now_local(), self.settings.quiet_start, self.settings.quiet_end):
+    async def _notify(self, title: str, body: str, priority: str = "normal",
+                      *, bypass_quiet: bool = False) -> list[dict]:
+        if not bypass_quiet and in_quiet_hours(
+                now_local(), self.settings.quiet_start, self.settings.quiet_end):
             self.db.log_push("quiet", "-", True, f"免打扰时段跳过：{title}")
             logger.info("免打扰时段，跳过推送：%s", title)
             return []
@@ -1095,13 +1392,37 @@ class AppService:
         return results
 
     async def push_new_tasks(self, tasks: list[dict], summary: str) -> None:
+        """推送新建待办；采集轮内先收集，轮末合并成一条（同轮合并推送）。"""
+        if not tasks:
+            return
+        collector = self._round_push
+        if collector is not None:
+            collector["tasks"].extend(tasks)
+            if summary:
+                collector["summaries"].append(str(summary))
+            return
+        await self._send_new_tasks_push(tasks, summary)
+
+    async def _flush_round_push(self, collector: dict) -> None:
+        """把采集轮内收集到的待办合并成一条推送（标题 + 数量 + 摘要 + 前几条明细）。"""
+        tasks = collector.get("tasks") or []
+        if not tasks:
+            return
+        # 摘要可能来自多个会话：去重后拼接，超长截断，避免推送正文爆掉
+        summaries = list(dict.fromkeys(
+            str(item).strip() for item in (collector.get("summaries") or []) if str(item).strip()))
+        summary = "；".join(summaries)[:200]
+        await self._send_new_tasks_push(tasks, summary, limit=6)
+
+    async def _send_new_tasks_push(self, tasks: list[dict], summary: str,
+                                  limit: int = 4) -> None:
         lines = []
-        for task in tasks[:4]:
+        for task in tasks[:limit]:
             meta = task.get("group_name") or ""
             due = human_due(task.get("due_at"))
             extra = " · ".join(part for part in (meta, due) if part)
             lines.append(f"• {task['title']}" + (f"（{extra}）" if extra else ""))
-        if len(tasks) > 4:
+        if len(tasks) > limit:
             lines.append(f"…共 {len(tasks)} 项")
         body = "\n".join(lines)
         if summary:
@@ -1159,12 +1480,12 @@ class AppService:
 
     # ---------- 演示 ----------
     async def seed_demo(self) -> dict:
-        messages = await self.weflow.demo_messages()
+        messages = demo_messages()
         for message in messages:
             self.db.add_message(
                 rawid=message["rawid"], session_id=message["session_id"],
                 group_name=message["group_name"], sender=message["sender"],
-                content=message["content"], ts=message["ts"],
+                content=message["content"], ts=message["ts"], processed=1, payload=message,
             )
         stats = await self.process_batch(messages)
         stats["tasks_created"] = max(stats.get("tasks_created", 0), 0)
@@ -1174,7 +1495,39 @@ class AppService:
     def health(self) -> dict:
         counts = self.db.counts()
         source = self.source
-        source_connected = self.connected and source is not None
+        # connected 由采集轮驱动：None=首轮采集尚未完成，True/False=最近一轮结果
+        source_connected = False if source is None else self.connected
+        collection_enabled = self._collect_enabled()
+        pending_messages = self.db.count_unprocessed()
+        pending_sessions = len(self.db.unprocessed_sessions())
+        failed_messages = self.db.count_failed_messages()
+        failed_sessions = len(self.db.failed_sessions())
+        states = self.db.catchup_states()
+        collection = {
+            "enabled": collection_enabled,
+            "mode": "watermark" if collection_enabled else "off",
+            "seconds": self.settings.wcda_catchup_seconds,
+            "lookback_minutes": self.settings.wcda_catchup_lookback_minutes,
+            "backfill_minutes": self.settings.wcda_catchup_on_start_minutes,
+            "max_hours": self.settings.wcda_catchup_max_hours,
+            "page_size": self.settings.wcda_catchup_page_size,
+            "round_budget": self.settings.wcda_catchup_round_budget,
+            "empty_history_hours": self.settings.wcda_catchup_empty_history_hours,
+            "overlap_seconds": self.settings.wcda_catchup_overlap_seconds,
+            "deep_scan_minutes": self.settings.wcda_deep_scan_minutes,
+            "deep_scan_lookback_minutes": self.settings.wcda_deep_scan_lookback_minutes,
+            "max_attempts": self.settings.message_max_attempts,
+            "watermarks": len(states),
+            # 已建立 localId 游标的会话数（localId 增量是本轮采集的主依据）
+            "cursor_sessions": sum(1 for item in states if int(item.get("last_local_id") or 0) > 0),
+            "pending_messages": pending_messages,
+            "pending_sessions": pending_sessions,
+            # 失败队列：重试超限、等待人工处理的消息 / 会话
+            "failed_messages": failed_messages,
+            "failed_sessions": failed_sessions,
+            "last_ok_at": self._last_collect_ok_at,
+            "last": self._last_collection,
+        }
         return {
             "ok": True,
             "data_source": self.data_source,
@@ -1184,14 +1537,7 @@ class AppService:
                 "connected": source_connected,
                 "last_event_at": self.last_event_at,
                 "last_error": self.last_error,
-                "stream_mode": "per-session" if self.data_source == "wcda" else "single",
-                "streams": len(self._stream_tasks),
-            },
-            # 兼容旧前端字段：始终返回，但只有 weflow 数据源时才有意义
-            "weflow": {
-                "configured": self.weflow.configured if self.data_source == "weflow" else False,
-                "connected": source_connected if self.data_source == "weflow" else False,
-                "last_event_at": self.last_event_at,
+                "last_collect_at": self._last_collect_at if self.data_source == "wcda" else None,
             },
             "wcda": {
                 "configured": self.wcda.configured,
@@ -1211,11 +1557,14 @@ class AppService:
                 "pinned_count": len(self.pinned_sessions),
                 "pinned_ready": self.pinned_ready,
             },
-            "only_new_messages": self.settings.only_new_messages,
             "events": {
                 "open": self.db.count_open_events(),
-                "buffered_sessions": sum(1 for msgs in self.session_buffers.values() if msgs),
-                "buffered_messages": sum(len(msgs) for msgs in self.session_buffers.values()),
+                # 已入库未处理（采集兜底队列）：用来判断有没有丢单/积压
+                "pending_sessions": pending_sessions,
+                "pending_messages": pending_messages,
+                # 失败队列（重试超限）
+                "failed_sessions": failed_sessions,
+                "failed_messages": failed_messages,
             },
             "identity": {
                 "account": self.identity.account,
@@ -1225,19 +1574,9 @@ class AppService:
                 "groups_cached": len(self.identity.snapshot()["groups"]),
                 "judgments": {**self._judge_stats, "since": self._judge_since},
             },
-            "catchup": {
-                "enabled": self._catchup_enabled(),
-                "seconds": self.settings.wcda_catchup_seconds,
-                "lookback_minutes": self.settings.wcda_catchup_lookback_minutes,
-                "backfill_minutes": self.settings.wcda_catchup_on_start_minutes,
-                "mode": "watermark" if self._catchup_enabled() else "off",
-                "max_hours": self.settings.wcda_catchup_max_hours,
-                "page_size": self.settings.wcda_catchup_page_size,
-                "round_budget": self.settings.wcda_catchup_round_budget,
-                "empty_history_hours": self.settings.wcda_catchup_empty_history_hours,
-                "watermarks": len(self.db.catchup_states()),
-                "last": self._last_catchup,
-            },
+            # 主字段：采集（旧字段 catchup 保留为兼容别名，deprecated）
+            "collection": collection,
+            "catchup": collection,
             "tasks": {"pending": counts["today"] + counts["week"] + counts["later"]},
             "version": self.settings.version,
         }
@@ -1401,7 +1740,6 @@ class AppService:
             "pinned_count": len(self.pinned_sessions),
             "pinned_ready": self.pinned_ready,
             "data_source": self.data_source,
-            "only_new_messages": s.only_new_messages,
         }
 
     def update_filter_settings(self, *, include_private: bool | None = None,

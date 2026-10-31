@@ -633,17 +633,19 @@ def is_duplicate_title(tasks: list[ExtractedTask], candidate: ExtractedTask) -> 
 
 
 # ---------------------------------------------------------------------------
-# 新建待办 × 手动待办：合并 / 拆分判定
+# 新建待办 × 手动待办：合并 / 拆分 / 已忽略去重
 #
 # 背景：手动添加的待办（网页「手动添加」、手机「手机添加」）不属于事项账本，
 # 归并模型看不到它们，于是同一件事再被聊到时系统会另建一条重复待办。
 # 这里在模型总结出新待办之后再判定一次：
-#   - same  ：新待办几乎就是某条手动待办的事 → 只把细节补进手动待办，不新建；
-#   - split ：新待办 = 某条手动待办的事 + 另一件独立的事 → 补细节，剩余部分另建；
-#   - none  ：无关 → 照常新建。
+#   - same    ：新待办几乎就是某条手动待办的事 → 只把细节补进手动待办，不新建；
+#   - split   ：新待办 = 某条手动待办的事 + 另一件独立的事 → 补细节，剩余部分另建；
+#   - suppress：新待办就是用户最近「忽略」过的那件事 → 直接丢弃，不再新建
+#               （只抑制新建，不改写已忽略任务；窗口外/新一期活动仍照常新建）；
+#   - none    ：无关/拿不准 → 照常新建。
 # 底线：手动待办的标题 / 已有截止时间绝不改，补充只写空白字段。
 # ---------------------------------------------------------------------------
-MANUAL_MATCH_SYSTEM_PROMPT = """你是微信待办的「手动待办合并判定器」，负责判断模型新生成的待办是否与用户手动添加的待办是同一件事。
+MANUAL_MATCH_SYSTEM_PROMPT = """你是微信待办的「手动待办合并判定器」，负责判断模型新生成的待办是否与用户手动添加（或已忽略）的待办是同一件事。
 只输出 JSON，不要输出解释。"""
 
 
@@ -658,6 +660,19 @@ def _format_manual_tasks(tasks: list[dict]) -> str:
             f"截止：{task.get('due_at') or '空'} | 备注：{notes or '空'}"
         )
     return "\n".join(lines)
+
+
+def _format_ignored_tasks(tasks: list[dict]) -> str:
+    """已忽略的手动待办：只列标题和忽略时间，禁止补写，只用于判定是否重复。"""
+    lines = []
+    for task in tasks:
+        ignored_at = str(task.get("updated_at") or "")[:16].replace("T", " ")
+        lines.append(
+            f"- task_id={task.get('id')} | 标题：{task.get('title') or ''} | "
+            f"忽略时间：{ignored_at or '未知'}"
+        )
+    return "\n".join(lines) or "（无）"
+
 
 
 def _format_manual_candidates(candidates: list[ExtractedTask]) -> str:
@@ -682,12 +697,20 @@ def _format_manual_match_messages(messages: list[dict], limit: int = 20) -> str:
 
 
 def _build_manual_match_prompt(candidates: list[ExtractedTask], manual_tasks: list[dict],
-                               messages: list[dict], now: datetime) -> str:
+                               messages: list[dict], now: datetime,
+                               ignored_tasks: list[dict] | None = None,
+                               suppress_days: int = 30) -> str:
+    ignored_block = ""
+    if ignored_tasks:
+        ignored_block = f"""
+# 最近 {suppress_days} 天内用户「已忽略」的手动待办（同类消息不再新建待办；不要改它们、不要补写）
+{_format_ignored_tasks(ignored_tasks)}
+"""
     return f"""现在时间：{now.strftime('%Y-%m-%d %H:%M')}。
 
 # 用户手动添加的待办（只能补空白字段；标题、已有截止时间禁止修改）
 {_format_manual_tasks(manual_tasks)}
-
+{ignored_block}
 # 模型本轮新生成的待办（待判定，编号 c0、c1…）
 {_format_manual_candidates(candidates)}
 
@@ -697,29 +720,35 @@ def _build_manual_match_prompt(candidates: list[ExtractedTask], manual_tasks: li
 请逐条判断每个新待办和哪条手动待办是同一件事：
 - "same"：新待办说的就是某条手动待办这件事，只是更详细（补了时间/地点/要求）→ 补进手动待办，不再新建；
 - "split"：新待办既包含某条手动待办这件事，又包含另一件独立的、需要单独跟进的事 → 属于手动待办的部分补进去，剩余部分作为新待办保留；
+- "suppress"：整条新待办就是某条「已忽略」的那件事（重复提醒、同一活动同一件事）→ 直接丢弃，不再新建待办；
 - "none"：和手动待办无关，或者拿不准是不是同一件事 → 照常新建。
 
-判定要点：
+判定顺序与要点：
+- 先看「用户手动添加的待办」：能 same / split 就优先补进去；
+- 再看「已忽略的手动待办」：只有整条新待办都属于那件被忽略的事时才判 suppress；如果消息里还包含另一件独立的事，或拿不准、看起来是新一期/下一次/另一个活动 → 判 none（照常新建，避免误吞真事）；
 - 新待办里出现「并 / 然后 / 还要 / 同时」，或明显包含两个不同动作（一个「参加/去/到场」，另一个「填写/接龙/报名/提交/交/登记」）时，必须判 split，把第二个动作放进 remainder，不能因为两件事相关就判 same；
 - 只是同一件事的细节更全（多了时间/地点/要求/提醒），没有多出另一个动作 → same。
 
 例1：手动待办「科创破冰」+ 新待办「参加科创破冰活动」→ same；
 例2：手动待办「科创破冰」+ 新待办「参加科创破冰活动并填写人数统计接龙」→ split，remainder「填写科创破冰人数统计接龙」；
-例3：手动待办「科创破冰」+ 新待办「长江大讲堂报名」→ none。
+例3：手动待办「科创破冰」+ 新待办「长江大讲堂报名」→ none；
+例4：已忽略「青马工程报名」+ 新待办「青马工程报名截止提醒」→ suppress；
+例5：已忽略「青马工程报名」+ 新待办「下期青马工程开始报名」→ none（新一期，照常新建）。
 
 补充规则（必须遵守）：
 - 手动待办的标题和已有的截止时间绝对不能改；只能补它目前为空的字段；
 - 补充备注只写原文里有依据的信息（时间/地点/要求），不要编造；
 - split 的 remainder 只写「不属于手动待办」的那部分，标题动词开头、不超过 20 字；
-- 只有明确是同一件事才判 same / split；只是话题沾边、实际是另一件事的判 none。
+- suppress 不写 supplement_notes / supplement_due，也不要引用未完成的手动待办；
+- 只有明确是同一件事才判 same / split / suppress；只是话题沾边、实际是另一件事的判 none。
 
 输出 JSON（不要 markdown）：
 {{
   "decisions": [
     {{
       "index": 0,
-      "relation": "same | split | none",
-      "manual_task_id": "对应的手动待办 task_id；none 时留空",
+      "relation": "same | split | none | suppress",
+      "manual_task_id": "same/split 填对应手动待办 task_id；suppress 填对应已忽略待办 task_id；none 时留空",
       "supplement_notes": "要补进手动待办的细节；没有就留空",
       "supplement_due": "要补进手动待办的截止时间 YYYY-MM-DD HH:MM；没有或手动已有截止时间就填 null",
       "remainder": {{
@@ -737,7 +766,7 @@ def _build_manual_match_prompt(candidates: list[ExtractedTask], manual_tasks: li
 class ManualDecision:
     """一条新待办与手动待办的判定结果。"""
     index: int
-    relation: str  # same | split | none
+    relation: str  # same | split | none | suppress
     manual_task_id: str | None = None
     supplement_notes: str = ""
     supplement_due: str | None = None
@@ -746,11 +775,13 @@ class ManualDecision:
 
 def _normalize_manual_decisions(data: dict, candidates: list[ExtractedTask],
                                 manual_tasks: list[dict],
-                                now: datetime) -> list[ManualDecision]:
+                                now: datetime,
+                                ignored_tasks: list[dict] | None = None) -> list[ManualDecision]:
     raw = data.get("decisions")
     if not isinstance(raw, list):
         return []
     manual_ids = {str(task.get("id")) for task in manual_tasks if task.get("id")}
+    ignored_ids = {str(task.get("id")) for task in (ignored_tasks or []) if task.get("id")}
     by_index: dict[int, ManualDecision] = {}
     for item in raw:
         if not isinstance(item, dict):
@@ -762,9 +793,19 @@ def _normalize_manual_decisions(data: dict, candidates: list[ExtractedTask],
         if index < 0 or index >= len(candidates):
             continue
         relation = str(item.get("relation") or "").strip().lower()
-        if relation not in ("same", "split", "none"):
+        if relation not in ("same", "split", "none", "suppress"):
             continue
         manual_task_id = str(item.get("manual_task_id") or "").strip() or None
+        if relation == "suppress":
+            # 已忽略去重：必须引用窗口内真实存在的已忽略待办，否则按无关处理
+            if manual_task_id not in ignored_ids:
+                logger.warning("已忽略去重引用了未知 task_id，按无关处理：%s", manual_task_id)
+                relation = "none"
+                manual_task_id = None
+            by_index[index] = ManualDecision(
+                index=index, relation=relation, manual_task_id=manual_task_id,
+            )
+            continue
         if relation in ("same", "split") and manual_task_id not in manual_ids:
             # 模型引用了不存在的任务：宁可不合并，也不能乱写
             logger.warning("手动待办合并判定引用了未知 task_id，按无关处理：%s", manual_task_id)
@@ -804,12 +845,18 @@ def _normalize_manual_decisions(data: dict, candidates: list[ExtractedTask],
 
 async def llm_match_manual(candidates: list[ExtractedTask], manual_tasks: list[dict],
                            messages: list[dict], settings: Settings,
-                           now: datetime | None = None) -> list[ManualDecision] | None:
-    """判定新待办是否与手动待办重复：几乎相同 → 补充；部分相同 → 补充 + 拆分。
+                           now: datetime | None = None,
+                           ignored_tasks: list[dict] | None = None) -> list[ManualDecision] | None:
+    """判定新待办与手动待办的关系：补充 / 拆分 / 已忽略去重。
+
+    - 未完成的手动待办：几乎相同 → 补充；部分相同 → 补充 + 拆分；
+    - 最近 N 天内被忽略的手动待办：同一件事 → suppress（丢弃新待办，不改写已忽略任务）；
+    - 都不匹配 → none（照常新建）。
 
     返回 None 表示本次没有判定（LLM 未启用 / 调用失败 / 输出不可用），调用方按原逻辑新建。
     """
-    if not candidates or not manual_tasks:
+    ignored_tasks = ignored_tasks or []
+    if not candidates or (not manual_tasks and not ignored_tasks):
         return None
     if not settings.llm_enabled or not settings.llm_api_key:
         return None
@@ -824,7 +871,9 @@ async def llm_match_manual(candidates: list[ExtractedTask], manual_tasks: list[d
             messages=[
                 {"role": "system", "content": MANUAL_MATCH_SYSTEM_PROMPT},
                 {"role": "user", "content": _build_manual_match_prompt(
-                    candidates, manual_tasks, messages, now)},
+                    candidates, manual_tasks, messages, now,
+                    ignored_tasks=ignored_tasks,
+                    suppress_days=int(getattr(settings, "manual_suppress_days", 30) or 30))},
             ],
             temperature=0.0,
             response_format={"type": "json_object"},
@@ -838,5 +887,6 @@ async def llm_match_manual(candidates: list[ExtractedTask], manual_tasks: list[d
         return None
     if not isinstance(data, dict):
         return None
-    return _normalize_manual_decisions(data, candidates, manual_tasks, now)
+    return _normalize_manual_decisions(data, candidates, manual_tasks, now,
+                                       ignored_tasks=ignored_tasks)
 

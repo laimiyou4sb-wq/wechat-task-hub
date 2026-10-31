@@ -8,7 +8,7 @@
   <title>设置 · 微信待办</title>
   <link rel="icon" href="./icons/icon-192.png">
   <link rel="stylesheet" href="./styles.css">
-  <link rel="stylesheet" href="./settings.css?v=20261029-1">
+  <link rel="stylesheet" href="./settings.css?v=20261031-1">
 </head>
 <body class="settings-page">
   <header class="settings-header">
@@ -315,8 +315,8 @@
             <span id="statusPill" class="status-pill status-pill--muted">读取中…</span>
           </div>
           <p class="card-desc">
-            数据源、补采、置顶同步与事项账本的当前快照，全部来自 <code>GET /api/health</code>；
-            补采为全自动运行（参数与上次结果见下方「补采」），置顶同步只刷新监控范围。
+            数据源、采集、置顶同步与事项账本的当前快照，全部来自 <code>GET /api/health</code>；
+            采集是唯一采集方法、全自动运行（参数与上次结果见下方「采集」），置顶同步只刷新监控范围。
           </p>
 
           <div id="statusError" class="identity-error" hidden>
@@ -339,8 +339,8 @@
                   <strong id="statusSourceConnected">—</strong>
                 </div>
                 <div class="caldav-meta-item">
-                  <span>实时流</span>
-                  <strong id="statusStreams">—</strong>
+                  <span>上次采集</span>
+                  <strong id="statusLastCollect">—</strong>
                 </div>
                 <div class="caldav-meta-item">
                   <span>最近消息</span>
@@ -352,7 +352,7 @@
 
             <div class="identity-subsection">
               <div class="identity-subhead">
-                <h3 class="identity-subtitle">补采</h3>
+                <h3 class="identity-subtitle">采集</h3>
                 <span id="statusCatchupHint" class="key-hint"></span>
               </div>
               <div class="caldav-meta status-grid">
@@ -389,15 +389,50 @@
                   <strong id="statusCatchupBackfill">—</strong>
                 </div>
                 <div class="caldav-meta-item">
+                  <span>晚到消息深扫</span>
+                  <strong id="statusDeepScan">—</strong>
+                </div>
+                <div class="caldav-meta-item">
                   <span>会话水位</span>
                   <strong id="statusCatchupWatermarks">—</strong>
                 </div>
+                <div class="caldav-meta-item">
+                  <span>localId 游标</span>
+                  <strong id="statusCursorSessions">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>待处理消息</span>
+                  <strong id="statusCollectPendingMessages">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>待处理会话</span>
+                  <strong id="statusCollectPendingSessions">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>重试上限</span>
+                  <strong id="statusMaxAttempts">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>失败队列</span>
+                  <strong id="statusFailedMessages">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>失败会话</span>
+                  <strong id="statusFailedSessions">—</strong>
+                </div>
               </div>
-              <p id="statusCatchupLast" class="hint-line">上次补采：尚未执行</p>
+              <p id="statusCatchupLast" class="hint-line">上次采集：尚未执行</p>
               <p class="hint-line">
-                补采全自动运行：启动 8 秒后先按水位补一次，之后每轮按会话水位续补；
-                读取失败或积压超限的会话保留水位，下一轮自动重试，无需手动触发。
+                采集全自动运行：启动 8 秒后先按 localId 游标采集一次，之后每轮按游标续采
+                （首次建立游标时按时间水位回看，能兜住「写入晚、业务时间旧」的晚到消息）；
+                每轮拿到消息后按会话一次处理，同轮新建的待办合并成一条推送；
+                单条消息处理失败最多重试「重试上限」次，超限进入失败队列并告警，
+                不再阻塞同一会话的后续消息。
               </p>
+              <div class="form-actions">
+                <button type="button" id="retryFailedBtn" class="btn-secondary">重试失败队列</button>
+              </div>
+              <p id="retryFailedResult" class="test-result" hidden></p>
             </div>
 
             <div class="identity-subsection">
@@ -435,11 +470,11 @@
                   <strong id="statusEventsOpen">—</strong>
                 </div>
                 <div class="caldav-meta-item">
-                  <span>缓冲会话</span>
+                  <span>待处理会话</span>
                   <strong id="statusBufferedSessions">—</strong>
                 </div>
                 <div class="caldav-meta-item">
-                  <span>缓冲消息</span>
+                  <span>待处理消息</span>
                   <strong id="statusBufferedMessages">—</strong>
                 </div>
               </div>
@@ -459,15 +494,11 @@
                   <span>待办</span>
                   <strong id="statusTasksPending">—</strong>
                 </div>
-                <div class="caldav-meta-item">
-                  <span>仅新消息</span>
-                  <strong id="statusOnlyNew">—</strong>
-                </div>
               </div>
             </div>
 
             <div class="status-foot">
-              <p class="hint-line">数字为服务端最近一次统计，点「刷新状态」重新读取；补采为全自动运行，明细见「补采」。</p>
+              <p class="hint-line">数字为服务端最近一次统计，点「刷新状态」重新读取；采集为全自动运行，明细见「采集」。</p>
               <div class="form-actions">
                 <button type="button" id="statusRefreshBtn" class="btn-ghost">刷新状态</button>
               </div>
@@ -563,6 +594,6 @@
   </div>
 
   <div id="toast" class="toast" hidden></div>
-  <script src="./settings.js?v=20261029-1" defer></script>
+  <script src="./settings.js?v=20261031-2" defer></script>
 </body>
 </html>

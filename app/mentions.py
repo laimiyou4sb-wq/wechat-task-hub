@@ -219,7 +219,7 @@ def classify_message(content: str, *, at_usernames: list[str] | None = None,
         if other_name:
             return Verdict("other", "at", f"@他人（{other_name}）", [other_name])
 
-    # 2) 正文里手动 @ 昵称（weflow / 未带 atUsernames 时）
+    # 2) 正文里手动 @ 昵称（消息没带 atUsernames 时）
     tokens = parse_at_tokens(text)
     me_token = ""
     other_token = ""

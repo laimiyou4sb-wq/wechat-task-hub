@@ -3,10 +3,11 @@
 把电脑版微信的重要消息**自动归纳成待办任务**，推送到手机，并提供一个手机上可用的**任务表 PWA**。
 
 ```
-微信 PC ──► WeChatDataAnalysis（实时消息 SSE）
+微信 PC ──► WeChatDataAnalysis（本地只读 API）
                 │
                 ▼
-      按会话缓冲（静默 20s / 最长 5min 封口）
+      采集：每 120s 一轮，启动 8s 先采一次
+      每会话 localId 游标续采 + 晚到消息深扫
                 │
                 ▼
       事项账本：LLM 归并 / 拆分 / 更新
@@ -22,17 +23,18 @@
 
 ## 功能
 
-- **实时监听**：按监控会话逐个订阅 WeChatDataAnalysis 的 `/api/chat/realtime/messages`（单会话 SSE）；实测它的「全量」实时流存在不推送的 bug，所以不用全量模式，并每 2 分钟补采兜底
-- **只处理新消息**：实时流不回溯启动前的历史；补采全自动按会话水位补齐停机 / 断网期间漏掉的消息（无水位且启动前无历史时自动回看最近 1 天，超出单轮预算的余量在下一轮继续）。
+- **采集（唯一采集方法）**：wcda 数据源为全自动「采集」——服务启动 8 秒后先按每会话 **localId 游标**采集一次，之后每 120 秒一轮；游标是微信 WCDB 行序（与 createTime 解耦），每轮只取 localId 大于游标的消息，首次建立游标或 localId 重装 / 换库时回退时间窗重采并重设游标。WCDA 分页按 createTime 排序、且没有 localId 过滤参数，所以另有**晚到消息深扫**：每 60 分钟按 24 小时时间窗重扫一次，不推进游标、按 `rawid` 去重，专门兜住「写入晚、业务时间旧」的消息；无游标且启动前无历史时回看最近 1 天，单轮最多处理 2000 条，未处理完的保留为「已入库未处理」留到下一轮。用户可见延迟为分钟级；设置页「运行状态」可查看连接三态 / 上次采集 / localId 游标数 / 待处理消息与会话 / 失败队列 / 上次结果。
+- **增量采集**：按会话 localId 游标补齐未处理过的消息（含停机 / 断网期间漏掉的），已处理过的不会重复归纳；无游标时按时间窗回退，超出单轮预算的余量保留为「已入库未处理」在下一轮继续。
 - **@/点名身份判定**：自动识别我的 wxid、各群群昵称与群成员；被 @ 到别人、被点名指派给别人的消息**不再生成待办**；@ 我、直呼我（含外号 / 同音字 / 错别字）的照常生成；没有指定对象的群公告保持原有逻辑。设置页可手动补充别名、随时测试一句话的判定结果，并查看最近过滤记录
-- **补采兜底 / 置顶跟随**：补采全自动，无手动入口；后台默认每 2 分钟**按会话水位**补一次（实测 WCDA 实时流会漏消息），单轮预算 2000 条、余量自动留到下一轮，支持分页回溯长时间离线；无水位且启动前无历史时自动回看最近 1 天；置顶变化默认 60 秒内同步到监控范围，新置顶聊天自动回补最近 2 小时；设置页「运行状态」可查看上次补采/置顶结果，并「同步置顶」
+- **采集 / 置顶跟随**：采集全自动，无手动触发入口；后台默认每 2 分钟按会话 localId 游标续采，单轮最多处理 2000 条、未处理完的消息保留为「已入库未处理」自动留到下一轮，支持分页回溯长时间离线；无游标时按时间窗兜底；置顶变化默认 60 秒内同步到监控范围，新置顶聊天自动回补最近 2 小时；设置页「运行状态」可查看上次采集 / 置顶结果，并「同步置顶」
+- **失败重试与失败队列**：单条消息处理失败不拖垮整轮——小批次（≤30 条）整批失败后逐条隔离重试，能处理的立即处理；大积压（>30 条）先隔离探测前 30 条，若探测样本**全部**失败（LLM/网络等整体性故障）本轮只写 `last_error`、**不计 attempts**，下一轮自动重试（避免一次短时故障把积压灌进失败队列）；只要样本里有成功，就按毒消息累计 attempts、多轮逐批排空。连续 3 轮仍整体性失败会推送「采集持续失败」high 告警（`source.last_error` 同步记录），避免静默卡住。同一条消息累计失败 `MESSAGE_MAX_ATTEMPTS`（默认 3）次后置为 `processed=2` 进「失败队列」（`processed`：0=待处理、1=已处理、2=失败队列）并推送 high 优先级告警（不受免打扰限制），不再阻塞同一会话的后续消息；设置页「运行状态 → 采集」可查看并一键「重试失败队列」
 - **置顶白名单**：可只处理微信里置顶的聊天（自动同步，支持群聊+私聊），也可叠加自定义名单
 - **事项账本（M:N）**：多条消息可归并成一个事项/待办，一条消息可拆成多个待办；后续消息会更新原任务的截止时间与来源，而不是重复新建
 - **电脑端三栏**：≥1024px 为「分组导航 + 任务列表 + 详情面板」，白底黑白极简；时间分组（逾期 / 今天、本周按天、已完成按天；无截止时间的任务归「以后」）、搜索、快捷截止；任务详情显示**所属事项**（事项账本标题/摘要/状态）与**来源条数**，可改标题 / 优先级 / 截止 / 备注，已忽略 / 稍后可在导航找回，完成 / 忽略 / 稍后 5 秒内可撤销；支持批量选择（Shift 连选）批量完成 / 忽略 / 恢复 / **删除**，支持 `j/k`、`Enter`、`e`、`x`、`n`、`Esc` 快捷键；数据源断开时顶部给出可重试的提示横幅
 - **手机任务表**：今天 / 本周 / 以后 / 已完成；归档区可切换 已完成 / 已忽略 / 稍后，支持完成、稍后 1 小时、忽略、恢复、删除、查看原文来源（手机端保持原布局，仅同步黑白配色）
 - **自研安卓 App 同步**：手机装项目自带的「微信待办」安卓 App，**同一 Wi-Fi 时局域网直连**（`http://192.168.x.x:8765`），**在外网时走 ngrok 固定免费域名**（`https://xxx.ngrok-free.dev`，新版账号；旧版为 `.ngrok-free.app`；HTTPS）；靠「配对码」一次带上地址 + token，App 自动在局域网/远程地址间切换，离线可操作、联网自动补同步，支持到点提醒。教程见 [docs/手机同步.md](docs/手机同步.md)
-- **网页内配置**：⚙ 设置页可直接填 LLM Key、Bark/ntfy 推送、私聊开关、白名单模式、身份判定（手动别名 / 过滤开关 / 判定测试 / 最近过滤），保存即生效；「运行状态」卡片可看数据源连接 / 实时流 / 补采 / 置顶 / 事项账本，并可同步置顶；也能查看「手机 App」配对码与可用的局域网 / ngrok 地址并一键复制
-- **推送**：Bark（iPhone）或 ntfy（Android），免打扰时段自动静默，每天可选定时摘要
+- **网页内配置**：⚙ 设置页可直接填 LLM Key、Bark/ntfy 推送、私聊开关、白名单模式、身份判定（手动别名 / 过滤开关 / 判定测试 / 最近过滤），保存即生效；「运行状态」卡片可看数据源连接 / 上次采集 / localId 游标与采集参数 / 待处理与失败队列 / 上次结果 / 置顶 / 事项账本待处理数，并可同步置顶、重试失败队列；也能查看「手机 App」配对码与可用的局域网 / ngrok 地址并一键复制
+- **推送**：Bark（iPhone）或 ntfy（Android）；一次采集轮内新建的待办在轮末**合并成一条推送**（标题「微信待办 +N」，最多 6 条明细），同轮没有新待办则不推；采集轮之外的即时推送行为不变。免打扰时段自动静默，每天可选定时摘要
 - **本地优先**：数据只存本机 SQLite；服务默认只监听本机/局域网，远程访问通过 ngrok 隧道（免费固定 dev domain）按需开启
 
 ## 界面预览
@@ -73,7 +75,7 @@
 ### 1. 环境
 
 - Windows 10/11，Python 3.10+（已在 3.13 验证）
-- [WeChatDataAnalysis](https://github.com/LifeArchiveProject/WeChatDataAnalysis)（解密 + 读取微信 4.x 本地库，提供实时 API）
+- [WeChatDataAnalysis](https://github.com/LifeArchiveProject/WeChatDataAnalysis)（解密 + 读取微信 4.x 本地库，提供本地只读 API）
 - 可选：DeepSeek / OpenAI 兼容大模型 Key；Bark 或 ntfy
 
 ### 2. 配置 WeChatDataAnalysis
@@ -96,7 +98,7 @@ notepad .env
 | 变量 | 说明 |
 |---|---|
 | `APP_TOKEN` | 手机访问用的令牌，改成随机串 |
-| `DATA_SOURCE` | `wcda`（WeChatDataAnalysis）或 `weflow`（备用） |
+| `DATA_SOURCE` | `wcda`（WeChatDataAnalysis，默认）或 `demo`（演示模式，不连数据源）；旧配置里已删除的数据源会自动按 `wcda` 处理 |
 | `WCDA_BASE` | WeChatDataAnalysis API 地址，默认 `http://127.0.0.1:10392` |
 | `GROUP_WHITELIST` | 只监控的群（群名或 `xxx@chatroom`，逗号分隔）；留空 = 所有群 |
 | `ME_NAMES` | 你的昵称/外号清单（识别 @我 / 直呼我；群昵称会自动从微信同步，通常不用手填） |
@@ -189,19 +191,18 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8765/api/push/test" `
 - **手机推送**：填 Bark 地址（`https://api.day.app/xxx`）或 ntfy 主题；保存后点「发送测试推送」验证。
 - **包含私聊**：打开开关后，私聊消息也会归纳成待办。
 - **白名单模式**（4 选 1）：
-  1. `pinned` **仅置顶聊天**（推荐）：自动同步微信里置顶的群聊和私聊，每 3 分钟刷新；
+  1. `pinned` **仅置顶聊天**（推荐）：自动同步微信里置顶的群聊和私聊，每 1 分钟刷新；
   2. `pinned_custom` **置顶 + 自定义**：置顶聊天，外加手动填的群/联系人；
   3. `custom` **仅自定义名单**：只处理手动填写的群名 / 联系人备注 / wxid；
   4. `all` **全部聊天**：不过滤（消息量大、噪音多，适合先观察）。
 - 自定义名单支持每行一个，也支持逗号分隔；设置会写回 `.env` 并立即生效。
-- **只处理新消息**：实时流不回溯启动前的历史；补采全自动按会话水位补齐停机 / 断网期间漏掉的消息（无水位且启动前无历史时自动回看最近 1 天，超出单轮预算的余量会在下一轮继续）。
+- **增量补齐**：采集按会话 localId 游标自动补齐停机 / 断网期间漏掉的消息（「写入晚、业务时间旧」的晚到消息由周期性深扫兜底），已处理过的不会重复归纳；无游标时按时间窗回退，超出单轮预算的余量会在下一轮继续。
 
 ## 事项账本（多消息 ↔ 多任务）
 
 不再“一条消息生成一条待办”，而是维护持久化的「事项（event）」：
 
-- 同一会话的消息先进入缓冲区，**静默 20 秒**（或最长 5 分钟、30 条、6000 字）后封口；
-- 每轮把「未处理消息 + 该会话仍打开的事项/任务」一起交给 LLM：
+- 每轮采集把同一会话的「未处理消息 + 该会话仍打开的事项/任务」一次性交给 LLM（按会话处理，不再按条数切批）：
   - 多条消息说同一件事 → 归到同一个 event，生成/更新一条任务；
   - 一条消息包含多个动作 → 同一 event 下拆成多条任务；
   - 后续消息补充/修改截止时间 → 更新原任务并追加来源，不重复新建；
@@ -213,6 +214,7 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8765/api/push/test" `
   - 部分相同 → 重叠部分补进手动待办，另一件独立的事另建一条待办；
   - 无关 → 照常新建。
   - 底线：手动待办的**标题、已填的截止时间、已填的备注一律不改**，只补空白字段；来源消息会追加到详情页。
+- **已忽略去重（默认 30 天）**：手动待办被「忽略」后，`MANUAL_SUPPRESS_DAYS` 天内同一件事的消息**不再重复新建待办**（只丢弃新待办，不改写那条已忽略的待办）；超过窗口、或明显是另一期/另一次活动，仍照常新建，避免把真实的新活动吞掉。已完成（done）不参与这条规则；设为 `0` 可关闭。
 
 > 规则模式（未配置 LLM）仍可用，但退化为“一个会话批次 → 一个事项 + 规则任务”，跨批归并能力有限，建议配置 LLM。
 
@@ -222,19 +224,22 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8765/api/push/test" `
 |---|---|---|
 | `PORT` | 8765 | 服务端口 |
 | `APP_BASE_URL` | 空（自动探测局域网 IP） | 对外基础地址，一般**留空**；远程访问由 ngrok 隧道写 `data/tunnel.json` 提供。仅当用反向代理/CDN 固定对外地址时才填 |
-| `DATA_SOURCE` | wcda | `wcda` = WeChatDataAnalysis；`weflow` = WeFlow；`demo` = 不连数据源 |
+| `DATA_SOURCE` | wcda | `wcda` = WeChatDataAnalysis（走采集，默认）；`demo` = 不连数据源；旧配置里已删除的数据源会自动按 `wcda` 处理 |
 | `WCDA_BASE` | http://127.0.0.1:10392 | WeChatDataAnalysis 本地 API 地址 |
-| `WCDA_INTERVAL_MS` | 500 | 实时循环间隔，越小越实时 |
+| `WCDA_CATCHUP_SECONDS` | 120 | 采集轮间隔（秒；0=关闭周期轮，只在启动时采一轮） |
+| `WCDA_CATCHUP_LOOKBACK_MINUTES` / `WCDA_CATCHUP_MAX_HOURS` | 30 / 168 | 每轮最小回看（分钟）/ 单会话单轮最长回看（小时） |
+| `WCDA_CATCHUP_PAGE_SIZE` / `WCDA_CATCHUP_MAX_MESSAGES` | 500 / 50000 | 分页每页条数（50~1000）/ 单会话单轮最多拉取条数 |
+| `WCDA_CATCHUP_ROUND_BUDGET` | 2000 | 每轮最多处理条数（0=不限制），未处理消息保留 `processed=0` 下一轮继续 |
+| `WCDA_BACKFILL_MINUTES` | 0 | 启动时额外按固定窗口回补（分钟；0=只按 localId 游标采） |
+| `WCDA_DEEP_SCAN_MINUTES` | 60 | 晚到消息深扫间隔（分钟；0=关闭）：按时间窗重扫，不推进游标 |
+| `WCDA_DEEP_SCAN_LOOKBACK_MINUTES` | 1440 | 深扫回看窗口（分钟，默认 24 小时）；晚到消息兜底上限就是它（不是 `WCDA_CATCHUP_MAX_HOURS`），断网更久需调大（代价：每次深扫多翻页） |
+| `MESSAGE_MAX_ATTEMPTS` | 3 | 单条消息处理失败最大重试次数；超限进失败队列并告警 |
 | `WCDA_ACCOUNT` | 空 | 多账号时指定账号目录名 |
-| `BATCH_SECONDS` / `BATCH_MAX_MESSAGES` | 300 / 80 | 旧版固定批次参数，事件账本模式下仅兼容保留 |
-| `EVENT_IDLE_SECONDS` | 20 | 同一会话静默多少秒后封口处理（越小越实时） |
-| `EVENT_MAX_WAIT_SECONDS` | 300 | 一批消息最长等待时间，防止聊个不停一直不处理 |
-| `EVENT_MAX_MESSAGES` / `EVENT_MAX_CHARS` | 30 / 6000 | 单批消息条数/字符上限 |
+| `MANUAL_SUPPRESS_DAYS` | 30 | 手动待办被忽略后，多少天内同类消息不再重复新建待办（0=关闭；已完成不参与） |
 | `WHITELIST_MODE` | all | `all` 全部 / `pinned` 仅置顶 / `custom` 仅自定义 / `pinned_custom` 置顶+自定义 |
-| `PINNED_REFRESH_SECONDS` | 180 | 置顶会话自动同步间隔 |
+| `PINNED_REFRESH_SECONDS` | 60 | 置顶会话自动同步间隔 |
 | `GROUP_WHITELIST` | 空 | 自定义名单（群名 / 联系人备注 / wxid，逗号分隔） |
 | `INCLUDE_PRIVATE` | 0 | 是否处理私聊 |
-| `ONLY_NEW_MESSAGES` | 1 | 只处理服务启动后新收到的消息，不回溯历史 |
 | `LLM_ENABLED` / `LLM_BASE_URL` / `LLM_MODEL` | 自动 / deepseek / deepseek-chat | 大模型配置，任何 OpenAI 兼容端点均可 |
 | `PUSH_QUIET_START` / `END` | 23:00 / 07:30 | 免打扰时段（只影响推送，任务照常入库） |
 | `DAILY_DIGEST_TIME` | 08:30 | 每日待办摘要推送时间，留空关闭 |
@@ -299,6 +304,11 @@ wechat-task-hub/                 ← 应用根（开发态 APP_DIR；打包后 =
 curl -H "X-Auth-Token: <token>" "http://127.0.0.1:8765/api/tasks"
 # 健康检查（无需令牌）
 curl "http://127.0.0.1:8765/api/health"
+# 采集状态 / 失败队列（需令牌）
+curl -H "X-Auth-Token: <token>" "http://127.0.0.1:8765/api/collect/state"
+curl -H "X-Auth-Token: <token>" "http://127.0.0.1:8765/api/collect/failed"
+# 重试失败队列（需令牌；也可在设置页点「重试失败队列」）
+curl -X POST -H "X-Auth-Token: <token>" "http://127.0.0.1:8765/api/collect/failed/retry"
 ```
 
 手机同步相关：自研 App 接口在 `/api/app/*`（`X-Auth-Token` 鉴权，契约见 [docs/APP-SYNC-CONTRACT.md](docs/APP-SYNC-CONTRACT.md)）；`GET /api/app/pairing` 返回配对码与可用地址（局域网 + ngrok）。旧的 CalDAV / Tasks.org 方案已在本版本移除（`/dav/` 与 `/api/caldav/*` 不再提供）。
@@ -309,13 +319,13 @@ curl "http://127.0.0.1:8765/api/health"
 python -m pytest tests -q
 ```
 
-没有 WeChatDataAnalysis 时，可以用内置 mock 联调整条链路：
+没有 WeChatDataAnalysis 时，可以用内置 mock 联调整条采集链路（mock 提供 `/api/chat/sessions` 与 `/api/chat/messages` 分页，消息带 `localId`，可验证游标续采与晚到消息深扫）：
 
 ```powershell
-# 终端 1：mock 数据源（模拟 SSE 新消息）
+# 终端 1：mock 数据源（预置 2 个会话 / 6 条最近消息）
 python tests/mock_wcda_server.py 10399
-# 终端 2：让本项目连 mock
-$env:DATA_SOURCE="wcda"; $env:WCDA_BASE="http://127.0.0.1:10399"; $env:BATCH_SECONDS="2"
+# 终端 2：让本项目连 mock（采集轮 10 秒一次，便于观察）
+$env:DATA_SOURCE="wcda"; $env:WCDA_BASE="http://127.0.0.1:10399"; $env:WCDA_CATCHUP_SECONDS="10"
 python run.py --demo --port 8790
 ```
 
@@ -350,11 +360,22 @@ python tools/ui_smoke.py --base http://127.0.0.1:8765
 - 旧版缓存或服务端还是旧代码：强制刷新（`Ctrl+Shift+R`）并确认服务已重启；
 - 旧 CalDAV/Tasks.org/DAVx5/Tailscale 方案已从代码中移除，卡片只有「手机 App（直连同步）」。
 
-**`/api/health` 显示 `source.connected=false`**
-- `DATA_SOURCE=wcda`：WeChatDataAnalysis 是否在运行、`http://127.0.0.1:10392/docs` 能否打开、微信是否已登录并完成解密；
+**`/api/health` 显示 `source.connected=false` 或 `null`**
+- `connected=null`（仅 wcda）：首轮采集尚未完成，启动 8 秒后的首轮采集结束会变为 `true`；设置页「运行状态 → 采集」可看上次采集结果；
+- `connected=false` + `DATA_SOURCE=wcda`：采集轮失败 / WeChatDataAnalysis 是否在运行、`http://127.0.0.1:10392/docs` 能否打开、微信是否已登录并完成解密；
   - 若 `source.last_error` 里有 `No chat accounts found`：说明 WeChatDataAnalysis 还没完成账号配置，打开它的界面选择账号并解密一次；
-- `DATA_SOURCE=weflow`：WeFlow 是否启动、API 服务/主动推送是否开启、Token 是否一致；
-- 数据源重启后本项目会自动重连（5s 起指数退避）。
+- `source.last_error` 里有 `backlog_over_limit` / `too_many_pages`：该会话积压超过单轮上限，下一轮会继续（必要时调大 `WCDA_CATCHUP_MAX_MESSAGES` / `WCDA_CATCHUP_MAX_HOURS`）；
+- 数据源重启后本项目会自动重连（5s 起指数退避），采集下一轮会自动续上 localId 游标。
+
+**消息大量进失败队列**
+- `/api/health` 的 `collection.failed_messages`（或设置页「运行状态 → 采集」的「失败队列」）大于 0，说明有消息重试 `MESSAGE_MAX_ATTEMPTS` 次仍失败：点「重试失败队列」或调 `POST /api/collect/failed/retry` 放回待处理；`last_error` 保留最近一次错误；
+- 短时 LLM / 网络等整体性故障**不会**消耗重试次数：大积压（>30 条）整批失败时先探测前 30 条，样本全失败只记 `last_error`、下一轮自动重试，所以失败队列通常只收真正反复失败的毒消息；连续 3 轮仍整体性失败会推送「采集持续失败」告警，`source.last_error` 与设置页「最近错误」同步可见；
+- 失败消息不会再阻塞同一会话的后续消息，也不会被下一轮自动重试（需人工重试）。
+
+**晚到消息没采到 / 采集不全**
+- 确认 `WCDA_DEEP_SCAN_MINUTES` 没被设为 `0`（默认 60 分钟一次）；深扫按 `WCDA_DEEP_SCAN_LOOKBACK_MINUTES`（默认 24 小时）时间窗重扫，不推进 localId 游标；
+- **晚到消息的兜底上限就是这个深扫回看窗口**（默认 1440 分钟 = 24 小时），**不是** `WCDA_CATCHUP_MAX_HOURS`（168 小时）；断网 / 休眠更久后补同步的晚到消息需要调大 `WCDA_DEEP_SCAN_LOOKBACK_MINUTES`（代价：每次深扫多翻页）；
+- 停机很久后恢复：会按 localId 游标分页补齐（单会话最长回看 `WCDA_CATCHUP_MAX_HOURS`），积压超出单轮预算的余量留在下一轮。
 
 **一直不生成待办**
 - 看日志是否被 `群白名单` 过滤掉了；先把 `GROUP_WHITELIST` 留空试试；
@@ -378,7 +399,7 @@ python tools/ui_smoke.py --base http://127.0.0.1:8765
 - 免打扰时段内不推送（`PUSH_QUIET_START/END`）。
 
 **微信升级后读不到数据**
-- 升级 WeChatDataAnalysis（或 WeFlow）到最新版；本项目不直接碰微信数据库。
+- 升级 WeChatDataAnalysis 到最新版；本项目不直接碰微信数据库。
 
 **手机 App 的同步方向与行为**
 - 电脑 → 手机：标题、备注、截止时间、优先级、状态（App 启动/回前台/下拉刷新/每 15 分钟自动拉增量）；

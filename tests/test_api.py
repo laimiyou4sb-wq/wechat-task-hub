@@ -6,9 +6,11 @@ def test_health(client):
     assert response.status_code == 200
     body = response.json()
     assert body["ok"] is True
-    assert body["data_source"] in ("wcda", "weflow", "demo")
+    assert body["data_source"] in ("wcda", "demo")
     assert "source" in body
-    assert "weflow" in body and "push" in body
+    assert "wcda" in body and "push" in body
+    # weflow 数据源已彻底移除
+    assert "weflow" not in body
     assert "caldav" not in body
 
 
@@ -181,15 +183,17 @@ def test_task_detail_includes_match_reason(client):
 
 
 def test_manual_catchup_endpoint_removed(client):
-    """补采已改为全自动：手动补采接口不再提供。"""
+    """采集已改为全自动：手动采集接口不再提供。"""
     response = client.post("/api/catchup", headers=HEADERS, json={"minutes": 120})
     assert response.status_code in (404, 405)
 
 
-def test_health_includes_catchup(client):
+def test_health_includes_collection(client):
+    """health 主字段是 collection（采集），catchup 保留为兼容别名。"""
     body = client.get("/api/health").json()
-    assert "catchup" in body
-    assert "seconds" in body["catchup"]
+    assert "collection" in body
+    assert "seconds" in body["collection"]
+    assert body["catchup"] == body["collection"]
 
 
 def test_pinned_refresh_endpoint(client):

@@ -3,21 +3,16 @@
 WeChatDataAnalysis（LifeArchiveProject）桌面端启动后会在本机提供 FastAPI 服务：
 - 默认地址：http://127.0.0.1:10392
 - 健康检查：GET /api/health
-- 实时消息：GET /api/chat/realtime/messages（SSE，原生 WCDB 实时读取）
+- 会话列表：GET /api/chat/sessions
+- 消息采集：GET /api/chat/messages（按会话分页读取，采集唯一入口）
 
-SSE data 事件示例：
-    {"type":"message","account":"wxid_x","username":"123@chatroom",
-     "conversationName":"项目群","received":true,"cursor":123,
-     "message":{"localId":123,"serverId":..., "createTime":1760000000,
-                "senderUsername":"wxid_a","from":"张三","isSent":false,
-                "content":"明天下午3点开会","type":1,...}}
+注意：本项目只有这一条数据源/采集路径。后台采集轮按「每会话 localId 游标 + 时间水位」
+分页读取（见 app/service.py::collect），不再订阅任何实时 SSE。
 """
 from __future__ import annotations
 
-import json
 import logging
 import time
-from typing import AsyncIterator
 
 import httpx
 
@@ -30,7 +25,6 @@ class WcdaClient:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.base = settings.wcda_base.rstrip("/")
-        self.interval_ms = max(100, settings.wcda_interval_ms)
         self.account = settings.wcda_account.strip()
 
     @property
@@ -149,63 +143,6 @@ class WcdaClient:
                     offset += len(batch)
         return members[:limit]
 
-    async def stream_messages(self, username: str = "",
-                              since_local_id: int = 0) -> AsyncIterator[dict]:
-        """连接 WeChatDataAnalysis 的实时消息 SSE，逐条产出标准消息 dict。
-
-        传 ``username`` 时只订阅该会话（单会话模式）。实测 WCDA 的“全量”实时流
-        经常不推送消息，而单会话模式正常，所以 wcda 数据源默认按会话逐个订阅。
-        """
-        if not self.configured:
-            raise RuntimeError("WeChatDataAnalysis 未配置")
-        url = f"{self.base}/api/chat/realtime/messages"
-        params: dict = {
-            "interval_ms": self.interval_ms,
-            "include_sent": 1 if self.settings.wcda_include_sent else 0,
-        }
-        if self.account:
-            params["account"] = self.account
-        conversation = str(username or "").strip()
-        if conversation:
-            params["username"] = conversation
-            if int(since_local_id or 0) > 0:
-                params["since_local_id"] = max(1, int(since_local_id))
-        if self.settings.wcda_replay_username and self.settings.wcda_allow_replay:
-            params["username"] = self.settings.wcda_replay_username
-            params["since_local_id"] = max(1, self.settings.wcda_replay_since_id)
-        timeout = httpx.Timeout(connect=10, read=None, write=10, pool=10)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream("GET", url, params=params,
-                                     headers={"Accept": "text/event-stream"}) as response:
-                if response.status_code != 200:
-                    body = (await response.aread()).decode("utf-8", "ignore")[:300]
-                    raise RuntimeError(f"WeChatDataAnalysis 返回 {response.status_code}: {body}")
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    raw = line[5:].strip()
-                    if not raw:
-                        continue
-                    try:
-                        payload = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    event_type = payload.get("type")
-                    if event_type == "ready":
-                        # 流已建立（即使暂时没有新消息），让上层标记为已连接
-                        yield {
-                            "event": "stream.ready",
-                            "rawid": "",
-                            "account": payload.get("account", ""),
-                            "conversation_count": payload.get("conversationCount", 0),
-                        }
-                        continue
-                    if event_type != "message":
-                        continue
-                    message = self.convert_message(payload)
-                    if message:
-                        yield message
-
     @staticmethod
     def convert_message(payload: dict) -> dict | None:
         message = payload.get("message") or {}
@@ -285,7 +222,7 @@ class WcdaClient:
     @staticmethod
     def convert_api_message(session_id: str, group_name: str, message: dict,
                             account: str = "") -> dict | None:
-        """把 /api/chat/messages 里的消息转成内部标准 dict（补采用）。"""
+        """把 /api/chat/messages 里的消息转成内部标准 dict（采集用）。"""
         if not isinstance(message, dict):
             return None
         payload = {
@@ -299,7 +236,7 @@ class WcdaClient:
         return WcdaClient.convert_message(payload)
 
     async def fetch_recent_messages(self, username: str, limit: int = 300) -> list[dict]:
-        """读取某个会话最近的消息（补采兜底用）。"""
+        """读取某个会话最近的消息（采集用）。"""
         session = str(username or "").strip()
         if not self.configured or not session:
             return []
@@ -314,19 +251,19 @@ class WcdaClient:
                 response.raise_for_status()
                 payload = response.json()
         except Exception as error:
-            logger.warning("补采读取会话消息失败（%s）：%s", session, error)
+            logger.warning("采集读取会话消息失败（%s）：%s", session, error)
             return []
         rows = payload.get("messages") if isinstance(payload, dict) else None
         return [item for item in (rows or []) if isinstance(item, dict)]
 
     async def fetch_messages_page(self, username: str, *, limit: int = 500,
                                   offset: int = 0, order: str = "desc") -> dict:
-        """分页读取会话历史消息（补采增强用）。
+        """分页读取会话历史消息（采集用）。
 
         WCDA 的 ``offset`` 表示「从最新一条往前跳过多少条」，``order`` 只决定当前页内
         的排序方向；因此从 offset=0 开始逐页加大 offset 即可稳定回溯到更早的消息。
         返回 ``{"ok", "messages", "has_more", "error"}``，失败时不抛异常，交给调用方
-        决定是否跳过该会话（避免一条会话失败拖垮整轮补采）。
+        决定是否跳过该会话（避免一条会话失败拖垮整轮采集）。
         """
         session = str(username or "").strip()
         if not self.configured or not session:
@@ -348,7 +285,7 @@ class WcdaClient:
                 response.raise_for_status()
                 payload = response.json()
         except Exception as error:
-            logger.warning("补采分页读取失败（%s offset=%s）：%s", session, offset, error)
+            logger.warning("采集分页读取失败（%s offset=%s）：%s", session, offset, error)
             return {"ok": False, "messages": [], "has_more": False, "error": str(error)[:200]}
         rows = payload.get("messages") if isinstance(payload, dict) else None
         return {

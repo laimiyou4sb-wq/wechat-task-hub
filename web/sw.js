@@ -2,15 +2,15 @@
  * 导航请求（HTML）走 network-first：保证页面更新能立刻看到；
  * 静态资源 stale-while-revalidate；API 永不缓存。
  */
-const CACHE_NAME = 'wechat-todo-shell-v15';
+const CACHE_NAME = 'wechat-tasks-v20261031-2';
 const APP_SHELL = [
   './',
   './index.html',
   './styles.css',
   './app.js?v=20261028-1',
   './settings.html',
-  './settings.css?v=20261029-1',
-  './settings.js?v=20261029-1',
+  './settings.css?v=20261031-1',
+  './settings.js?v=20261031-2',
   './manifest.webmanifest',
   './logo.svg',
   './icons/icon-192.png',
