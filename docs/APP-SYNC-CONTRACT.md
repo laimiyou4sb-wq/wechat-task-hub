@@ -28,7 +28,7 @@
 ## 2. GET /api/app/ping
 
 ```json
-{"ok": true, "app": "wechat-task-hub", "version": "0.2.0", "server_time": "2026-10-26T19:20:00", "tz": "Asia/Shanghai"}
+{"ok": true, "app": "wechat-task-hub", "version": "0.3.0", "server_time": "2026-10-26T19:20:00", "tz": "Asia/Shanghai"}
 ```
 
 App 用它测连通性（超时 5 秒），也可在设置页「测试连接」用。

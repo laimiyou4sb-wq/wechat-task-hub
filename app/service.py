@@ -11,8 +11,9 @@ from urllib.parse import quote
 from .config import Settings
 from .db import Database
 from .envfile import write_env_values
-from .extract import (ExtractedTask, ReconcileResult, ReconcileTask, extract_tasks,
-                      llm_match_manual, llm_reconcile, rule_extract, task_dedupe_key)
+from .extract import (ExtractedTask, LLMUnavailable, ReconcileResult, ReconcileTask,
+                      extract_tasks, llm_match_manual, llm_reconcile, rule_extract,
+                      task_dedupe_key, titles_same_topic)
 from .filters import EVENT_HINTS, has_action_hint, is_worth_summarizing, should_send_to_llm
 from .identity import IdentityContext, IdentityResolver
 from .mentions import classify_message
@@ -61,6 +62,15 @@ def demo_messages() -> list[dict]:
 class AppService:
     #: 整批处理失败后逐条隔离重试的最大条数；超过后整批只计一次失败，避免放大耗时
     _ISOLATE_LIMIT = 30
+    #: LLM 回退告警：连续失败达到首次阈值后提醒，之后每多 N 次再提醒
+    _LLM_ALERT_FIRST = 3
+    _LLM_ALERT_EVERY = 10
+    #: 降级/告警的最小间隔（秒），避免 LLM 抖动的每一批都推一条
+    _LLM_ALERT_INTERVAL = 600
+    _CAP_ALERT_INTERVAL = 3600
+    #: 规则模式单轮单会话最多产出待办数（旧实现硬编码 12/批，洪峰下静默饱和；
+    #: 这里放大到 200 作为防噪兜底，真正被截断时会置 cap_hit 并上报降级）
+    _RULE_MAX_TASKS = 200
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -94,6 +104,16 @@ class AppService:
         self._round_push: dict | None = None
         # 晚到消息兜底深扫：距上次深扫超过 WCDA_DEEP_SCAN_MINUTES 才再扫
         self._last_deep_scan_at = time.monotonic()
+        # 深扫可观测（P2-4）：上次深扫完成时间与补回条数，health/设置页能看到
+        self._last_deep_scan_iso: str | None = None
+        self._last_deep_scan_result: dict | None = None
+        # LLM 降级可观测（P1-2）：调用失败会静默回退规则模式，必须对外暴露
+        self.last_llm_error: str | None = None
+        self._llm_fallback_total = 0
+        self._llm_fallback_streak = 0
+        self._llm_alert_next = self._LLM_ALERT_FIRST
+        self._last_llm_alert_at = 0.0
+        self._last_cap_alert_at = 0.0
         # 处理整体性故障的连续轮次（每会话）：连续多轮全失败时升级告警，
         # 避免「大积压 + 全毒消息」这类边界被静默卡住
         self._global_failure_streaks: dict[str, int] = {}
@@ -116,6 +136,9 @@ class AppService:
             self._workers.append(asyncio.create_task(self._collect_loop(), name="wcda-collect"))
         if self._needs_pinned() or self.data_source == "wcda":
             self._workers.append(asyncio.create_task(self._pinned_loop(), name="pinned-refresh"))
+        if self.settings.wcda_deep_scan_minutes <= 0:
+            logger.warning("晚到消息深扫已关闭（WCDA_DEEP_SCAN_MINUTES=0）："
+                           "写入晚、业务时间旧的晚到消息可能永久漏采")
         logger.info("服务已启动：%s（数据源 %s，白名单=%s）",
                     self.settings.base_url, self.data_source, self.settings.whitelist_mode)
 
@@ -186,11 +209,27 @@ class AppService:
         return added
 
     # ---------- wcda 采集（唯一采集方法） ----------
-    async def _monitored_sessions(self) -> list[dict]:
-        """当前监控范围内的会话（置顶 + 自定义名单），顺带同步置顶变化。"""
-        sessions = await self.wcda.fetch_sessions(limit=500)
+    async def _monitored_sessions(self) -> tuple[list[dict], str | None]:
+        """当前监控范围内的会话（置顶 + 自定义名单），顺带同步置顶变化。
+
+        返回 ``(targets, error)``：``error`` 非空表示**会话列表接口失败**（≠ 真的没有
+        会话），调用方必须把它当成采集失败暴露出去，否则会静默空转（P1-3）。
+        """
+        sessions: list[dict] = []
+        error: str | None = None
+        reader = getattr(self.wcda, "fetch_sessions_result", None)
+        if callable(reader):
+            fetched = await reader(limit=500)
+            if not fetched.get("ok"):
+                error = str(fetched.get("error") or "读取会话列表失败")
+                logger.warning("读取监控会话失败，本轮按采集失败处理：%s", error)
+                return [], error
+            sessions = list(fetched.get("sessions") or [])
+        else:  # 兼容旧客户端 / 测试桩
+            sessions = await self.wcda.fetch_sessions(limit=500)
+            sessions = list(sessions or [])
         if not sessions:
-            return []
+            return [], None
         self._sessions_cache = sessions
         self._apply_pinned_sessions(sessions)
         targets: list[dict] = []
@@ -207,7 +246,19 @@ class AppService:
             if not self._message_allowed(probe):
                 continue
             targets.append({"session_id": session_id, "group_name": group_name})
-        return targets
+        return targets, None
+
+    async def _fetch_sessions_cache(self) -> list[dict]:
+        """读取并缓存会话列表（显式回补会话名用）；失败只记日志，不阻断回补。"""
+        reader = getattr(self.wcda, "fetch_sessions_result", None)
+        if callable(reader):
+            fetched = await reader(limit=500)
+            if not fetched.get("ok"):
+                logger.warning("读取会话列表失败（不影响指定会话回补）：%s",
+                               fetched.get("error"))
+                return []
+            return list(fetched.get("sessions") or [])
+        return list(await self.wcda.fetch_sessions(limit=500) or [])
 
     def _collection_window_seconds(self, minutes: int | None, mode: str) -> int:
         """本轮采集的回看上限（秒）。
@@ -287,20 +338,26 @@ class AppService:
         - localId 回绕/重装：首页整页 ``localId <= cursor``，却出现比上轮时间水位
           更新的消息 → 说明本地库 localId 被重置，本轮弃用旧游标、按时间窗重采。
 
-        返回 ``{"ok", "rows", "complete", "pages", "error", "local_id", "cursor_reset"}``：
+        返回 ``{"ok", "rows", "complete", "pages", "error", "local_id", "cursor_reset",
+        "read_rows", "duplicate_rows"}``：
         - ``ok=False`` 表示读取失败或积压超过单轮上限，调用方应跳过该会话、保留游标；
-        - ``rows`` 已按时间升序排列；``local_id`` 是本批最大 localId。
+        - ``rows`` 已按时间升序排列；``local_id`` 是本批最大 localId；
+        - ``read_rows`` 是实际读到的原始行数、``duplicate_rows`` 是分页漂移造成的重复行
+          （P2-3 读取放大观测；已按 rawid 去重，不是数据错误）。
         """
         settings = self.settings
         floor = int(since_ts if floor_ts is None else floor_ts)
         cursor_mode = int(cursor or 0) > 0
         max_local_id = 0
         cursor_reset = False
+        read_rows = 0
+        duplicate_rows = 0
         fetcher = getattr(self.wcda, "fetch_messages_page", None)
         if not callable(fetcher):
             # 兼容旧客户端 / 测试桩：退化为单次读取最近消息
             reader = getattr(self.wcda, "fetch_recent_messages", None)
             batch = await reader(session_id, limit=settings.wcda_catchup_limit) if callable(reader) else []
+            read_rows = len(batch)
             rows: list[dict] = []
             for row in batch:
                 if not isinstance(row, dict):
@@ -316,7 +373,8 @@ class AppService:
                     rows.append(row)
             rows.sort(key=self._collect_row_ts)
             return {"ok": True, "rows": rows, "complete": True, "pages": 1,
-                    "local_id": max_local_id, "cursor_reset": False}
+                    "local_id": max_local_id, "cursor_reset": False,
+                    "read_rows": read_rows, "duplicate_rows": duplicate_rows}
 
         page_size = max(50, min(int(settings.wcda_catchup_page_size), 1000))
         max_rows = max(1000, int(settings.wcda_catchup_max_messages))
@@ -330,10 +388,12 @@ class AppService:
             if not page.get("ok"):
                 return {"ok": False, "rows": rows, "complete": False, "pages": pages,
                         "error": page.get("error") or "fetch_failed",
-                        "local_id": max_local_id, "cursor_reset": cursor_reset}
+                        "local_id": max_local_id, "cursor_reset": cursor_reset,
+                        "read_rows": read_rows, "duplicate_rows": duplicate_rows}
             batch = [row for row in (page.get("messages") or []) if isinstance(row, dict)]
             if not batch:
                 break
+            read_rows += len(batch)
             page_max_local_id = max(self._collect_row_local_id(row) for row in batch)
             page_max_ts = max(self._collect_row_ts(row) for row in batch)
             if cursor_mode and pages == 1 and page_max_local_id <= cursor \
@@ -350,6 +410,7 @@ class AppService:
                 key = str(row.get("id") or row.get("localId") or "")
                 if key:
                     if key in seen:
+                        duplicate_rows += 1
                         continue
                     seen.add(key)
                 row_local_id = self._collect_row_local_id(row)
@@ -372,17 +433,20 @@ class AppService:
             if len(rows) >= max_rows:
                 return {"ok": False, "rows": rows, "complete": False, "pages": pages,
                         "error": f"backlog_over_limit:{len(rows)}",
-                        "local_id": max_local_id, "cursor_reset": cursor_reset}
+                        "local_id": max_local_id, "cursor_reset": cursor_reset,
+                        "read_rows": read_rows, "duplicate_rows": duplicate_rows}
             if pages >= 400:
                 return {"ok": False, "rows": rows, "complete": False, "pages": pages,
                         "error": "too_many_pages",
-                        "local_id": max_local_id, "cursor_reset": cursor_reset}
+                        "local_id": max_local_id, "cursor_reset": cursor_reset,
+                        "read_rows": read_rows, "duplicate_rows": duplicate_rows}
             # WCDA 正常会返回 hasMore；短页且明确没有更多时才认为历史到底
             if len(batch) < page_size and not page.get("has_more"):
                 break
         rows.sort(key=self._collect_row_ts)
         return {"ok": True, "rows": rows, "complete": True, "pages": pages,
-                "local_id": max_local_id, "cursor_reset": cursor_reset}
+                "local_id": max_local_id, "cursor_reset": cursor_reset,
+                "read_rows": read_rows, "duplicate_rows": duplicate_rows}
 
     async def _wcda_alive(self) -> bool | None:
         """探测 WCDA 是否在线（只在「没有监控会话」时用于解释 connected）。"""
@@ -428,6 +492,13 @@ class AppService:
             "tasks_updated": 0, "dropped_other": 0, "failed": 0, "dead_lettered": 0,
             "budget_exhausted": False, "skipped": [], "pending": self.db.count_unprocessed(),
             "failed_queue": self.db.count_failed_messages(), "at": now_iso(),
+            # 降级 / 可观测（P1-1/P1-2/P1-4/P2-3/P2-5）：ok 只表示“没有会话读取/处理失败”，
+            # 抽取饱和、LLM 回退等“降级”单独用 degraded/degraded_reasons 暴露。
+            "partial": False, "degraded": False, "degraded_reasons": [],
+            "llm_batches": 0, "llm_fallbacks": 0, "last_llm_error": None,
+            "extraction_cap_hits": 0, "messages_without_task": 0,
+            "read_rows": 0, "duplicate_rows": 0, "read_ratio": 0.0,
+            "sessions_failed": [], "sessions_failed_count": 0,
         }
         if self.data_source != "wcda" or not self.wcda.configured:
             return {**empty_result, "reason": "当前数据源不是 wcda"}
@@ -440,14 +511,20 @@ class AppService:
         window_seconds = self._collection_window_seconds(minutes, mode)
         explicit = [str(item).strip() for item in (session_ids or []) if str(item).strip()]
         source_unreachable = False
+        sessions_error: str | None = None
         if explicit:
             if not self._sessions_cache:
-                self._sessions_cache = await self.wcda.fetch_sessions(limit=500)
+                self._sessions_cache = await self._fetch_sessions_cache()
             known = {str(s.get("username")): str(s.get("name") or "") for s in self._sessions_cache}
             targets = [{"session_id": sid, "group_name": known.get(sid, "")} for sid in explicit]
         else:
-            targets = await self._monitored_sessions()
-            if not targets:
+            targets, sessions_error = await self._monitored_sessions()
+            if sessions_error:
+                # 会话列表接口失败 ≠ 真的没有会话：本轮如实标记采集失败（P1-3），
+                # 但本地已入库未处理的消息仍然继续兜底处理。
+                self.connected = False
+                self.last_error = f"读取监控会话失败：{sessions_error}"[:300]
+            if not targets and not sessions_error:
                 alive = await self._wcda_alive()
                 if alive is False:
                     source_unreachable = True
@@ -466,10 +543,14 @@ class AppService:
                     })
             if not targets:
                 at = now_iso()
-                if source_unreachable:
+                if sessions_error or source_unreachable:
+                    reason = self.last_error or "WeChatDataAnalysis 未连接"
                     failed = {**empty_result, "mode": mode,
                               "minutes": int(round(window_seconds / 60)),
-                              "reason": self.last_error, "at": at}
+                              "reason": reason, "at": at,
+                              "degraded": True,
+                              "degraded_reasons": (["sessions_unavailable"]
+                                                   if sessions_error else [])}
                     self._last_collection = failed
                     self._last_collect_at = at
                     return failed
@@ -490,6 +571,13 @@ class AppService:
         inserted_total = processed_total = sessions_touched = 0
         created_total = updated_total = dropped_total = 0
         scanned_total = pages_total = failures = 0
+        read_rows_total = duplicate_rows_total = 0
+        llm_batches_total = llm_fallbacks_total = 0
+        cap_hits_total = without_task_total = 0
+        degraded_reasons: set[str] = set()
+        failed_sessions: list[str] = []
+        if sessions_error:
+            degraded_reasons.add("sessions_unavailable")
         dead_lettered: list[dict] = []
         skipped: list[str] = []
         # 同轮合并推送：本轮内新建的待办先收集，轮末合并成一条推送
@@ -519,9 +607,13 @@ class AppService:
                         session_id, since_ts, cursor=cursor,
                         watermark_ts=watermark_ts, floor_ts=floor_ts)
                     pages_total += int(fetched.get("pages") or 0)
+                    read_rows_total += int(fetched.get("read_rows") or 0)
+                    duplicate_rows_total += int(fetched.get("duplicate_rows") or 0)
                     if not fetched.get("ok"):
                         skipped.append(session_id)
+                        failed_sessions.append(session_id)
                         failures += 1
+                        degraded_reasons.add("partial_failure")
                         logger.warning("采集 %s 读取失败/积压过大，留到下一轮：%s",
                                        label, fetched.get("error"))
                     else:
@@ -548,6 +640,8 @@ class AppService:
                             except Exception as error:  # noqa: BLE001 - 入库失败保留游标，下轮重试
                                 failures += 1
                                 skipped.append(session_id)
+                                failed_sessions.append(session_id)
+                                degraded_reasons.add("partial_failure")
                                 logger.warning("采集 %s 入库失败，保留游标下轮重试：%s", label, error)
                                 continue
                             self.last_event_at = now_iso()
@@ -576,10 +670,19 @@ class AppService:
                 processed_total += outcome["processed"]
                 used_budget += outcome["processed"]
                 dead_lettered.extend(outcome["dead"])
+                llm_batches_total += int(outcome.get("llm_batches") or 0)
+                llm_fallbacks_total += int(outcome.get("llm_fallbacks") or 0)
+                cap_hits_total += int(outcome.get("cap_hits") or 0)
+                without_task_total += int(outcome.get("messages_without_task") or 0)
+                degraded_reasons.update(outcome.get("degraded_reasons") or [])
                 if outcome.get("failed"):
-                    # 处理失败（含整体性故障）也要体现在采集健康状态里，
-                    # 否则 health 只剩 pending 增长、last_error 永远为空
+                    # 读取/处理失败（含整体性故障）一律体现在采集健康状态里：
+                    # 本轮 ok=false、partial 按是否有实际进展标记（P1-4/P2-5）
                     failures += 1
+                    failed_sessions.append(session_id)
+                    degraded_reasons.add(str(outcome.get("failure_kind") or "partial_failure"))
+                    logger.warning("采集 %s：处理失败 %s 条（%s）", label, outcome["failed"],
+                                   outcome.get("failure_kind") or "failure")
                 if outcome["processed"]:
                     sessions_touched += 1
                 created_total += outcome["tasks_created"]
@@ -616,24 +719,51 @@ class AppService:
             "skipped": skipped[:20],
             "pending": self.db.count_unprocessed(),
             "failed_queue": self.db.count_failed_messages(),
+            # 降级 / 抽取饱和 / 分页读取放大：外部（设置页、脚本、告警）可见
+            "partial": False,
+            "degraded": bool(degraded_reasons),
+            "degraded_reasons": sorted(degraded_reasons),
+            "llm_batches": llm_batches_total,
+            "llm_fallbacks": llm_fallbacks_total,
+            "last_llm_error": self.last_llm_error,
+            "extraction_cap_hits": cap_hits_total,
+            "messages_without_task": without_task_total,
+            "read_rows": read_rows_total,
+            "duplicate_rows": duplicate_rows_total,
+            "read_ratio": (round(read_rows_total / scanned_total, 2)
+                           if read_rows_total and scanned_total else 1.0),
+            "sessions_failed": failed_sessions[:20],
+            "sessions_failed_count": len(failed_sessions),
             "duration_ms": int((time.monotonic() - started) * 1000),
             "at": now_iso(),
         }
-        self._last_collection = result
-        self._last_collect_at = result["at"]
         if source_unreachable:
             # 数据源不可达：本地未处理消息仍然已经处理，但 connected/ok 如实标记失败
             result["ok"] = False
             result["reason"] = self.last_error or "WeChatDataAnalysis 未连接"
             self.connected = False
-        else:
-            # 只要采集轮能跑完就说明数据源可达（个别会话读取/处理失败记录到 last_error）
-            self.connected = True
-            if failures == 0:
-                self._last_collect_ok_at = result["at"]
-                self.last_error = None
+        elif sessions_error or failures:
+            # ok=false 表示本轮有会话读取/处理失败；partial 表示仍有消息被处理（有进展）
+            result["ok"] = False
+            result["partial"] = bool(processed_total)
+            if sessions_error:
+                result["reason"] = f"读取监控会话失败：{sessions_error}"[:300]
+                self.connected = False
             else:
-                self.last_error = f"采集完成，但 {failures} 个会话失败（详见日志）"
+                result["reason"] = (
+                    f"采集部分失败：{failures} 个会话读取/处理失败（详见日志）"
+                    if result["partial"]
+                    else f"采集失败：{failures} 个会话读取/处理失败（详见日志）")
+                self.connected = True
+            self.last_error = result["reason"]
+        else:
+            # 只要采集轮能跑完就说明数据源可达
+            self.connected = True
+            self.last_error = None
+            if not result["degraded"]:
+                self._last_collect_ok_at = result["at"]
+        self._last_collection = result
+        self._last_collect_at = result["at"]
         # 同轮合并推送：本轮所有新建待办只发一条推送
         if collector is not None:
             try:
@@ -643,13 +773,18 @@ class AppService:
         # 处理失败重试超限：落失败队列并告警（不受免打扰限制）
         if dead_lettered:
             await self._alert_failed_messages(dead_lettered)
+        # 静默降级/抽取饱和不再只写日志：按阈值限频推送提醒
+        await self._maybe_alert_llm_degraded(result)
+        await self._maybe_alert_extraction_cap(result)
         logger.info("采集完成（%s）：会话 %s、扫描 %s、新增消息 %s、处理 %s、"
-                    "新建待办 %s、更新 %s、失败入队 %s、分页 %s、待处理 %s、耗时 %sms%s",
+                    "新建待办 %s、更新 %s、失败入队 %s、分页 %s、待处理 %s、耗时 %sms%s%s",
                     mode, result["sessions"], result["scanned"], result["inserted"],
                     result["processed"], result["tasks_created"], result["tasks_updated"],
                     result["dead_lettered"], result["pages"], result["pending"],
                     result["duration_ms"],
-                    "（预算用完，余量下轮继续）" if budget_exhausted else "")
+                    "（预算用完，余量下轮继续）" if budget_exhausted else "",
+                    (f"（降级：{','.join(result['degraded_reasons'])}）"
+                     if result["degraded"] else ""))
         return result
 
     async def catchup(self, minutes: int | None = None,
@@ -710,10 +845,23 @@ class AppService:
             raise
         except Exception as error:  # noqa: BLE001 - 深扫失败不影响主采集轮
             logger.warning("晚到消息深扫失败：%s", error)
+            self._last_deep_scan_result = {
+                "at": now_iso(), "lookback_minutes": minutes,
+                "error": f"{type(error).__name__}: {error}"[:200],
+            }
             return None
         logger.info("晚到消息深扫完成：扫描 %s、新增 %s、处理 %s、新建待办 %s",
                     result.get("scanned"), result.get("inserted"),
                     result.get("processed"), result.get("tasks_created"))
+        self._last_deep_scan_iso = now_iso()
+        self._last_deep_scan_result = {
+            "at": self._last_deep_scan_iso,
+            "lookback_minutes": minutes,
+            "scanned": int(result.get("scanned") or 0),
+            "inserted": int(result.get("inserted") or 0),
+            "processed": int(result.get("processed") or 0),
+            "tasks_created": int(result.get("tasks_created") or 0),
+        }
         result["deep_scan"] = True
         return result
 
@@ -729,6 +877,11 @@ class AppService:
             "budget_exhausted": False, "skipped": [],
             "pending": self.db.count_unprocessed(),
             "failed_queue": self.db.count_failed_messages(), "at": at,
+            "partial": False, "degraded": True, "degraded_reasons": ["collect_error"],
+            "llm_batches": 0, "llm_fallbacks": 0, "last_llm_error": self.last_llm_error,
+            "extraction_cap_hits": 0, "messages_without_task": 0,
+            "read_rows": 0, "duplicate_rows": 0, "read_ratio": 0.0,
+            "sessions_failed": [], "sessions_failed_count": 0,
             "reason": self.last_error,
         }
         self._last_collect_at = at
@@ -737,6 +890,39 @@ class AppService:
         return bool(self.data_source == "wcda" and self.wcda.configured
                     and (self.settings.wcda_catchup_seconds > 0
                          or self.settings.wcda_catchup_on_start_minutes > 0))
+
+    def _collection_metrics(self) -> dict:
+        """上一轮采集的降级/抽取饱和/分页读数快照（health 与设置页共用）。"""
+        last = self._last_collection or {}
+        return {
+            "degraded": bool(last.get("degraded")),
+            "degraded_reasons": list(last.get("degraded_reasons") or []),
+            "partial": bool(last.get("partial")),
+            "llm_batches": int(last.get("llm_batches") or 0),
+            "llm_fallbacks": int(last.get("llm_fallbacks") or 0),
+            "llm_fallback_total": self._llm_fallback_total,
+            "llm_fallback_streak": self._llm_fallback_streak,
+            "last_llm_error": self.last_llm_error,
+            "extraction_cap_hits": int(last.get("extraction_cap_hits") or 0),
+            "messages_without_task": int(last.get("messages_without_task") or 0),
+            "read_rows": int(last.get("read_rows") or 0),
+            "duplicate_rows": int(last.get("duplicate_rows") or 0),
+            "read_ratio": last.get("read_ratio") or 0.0,
+            "sessions_failed": list(last.get("sessions_failed") or []),
+            "llm": {
+                "enabled": bool(self.settings.llm_enabled),
+                "configured": bool(self.settings.llm_enabled and self.settings.llm_api_key),
+                "batch_messages": int(self.settings.llm_batch_messages),
+            },
+            "deep_scan": {
+                "minutes": int(self.settings.wcda_deep_scan_minutes),
+                "lookback_minutes": int(self.settings.wcda_deep_scan_lookback_minutes),
+                "disabled": int(self.settings.wcda_deep_scan_minutes) <= 0,
+                "due": self._deep_scan_due(),
+                "last_at": self._last_deep_scan_iso,
+                "last": self._last_deep_scan_result,
+            },
+        }
 
     def collection_state(self) -> dict:
         """采集游标/参数快照（设置页与排障用；states 最多返回最近 200 个会话）。"""
@@ -755,6 +941,7 @@ class AppService:
             "deep_scan_minutes": settings.wcda_deep_scan_minutes,
             "deep_scan_lookback_minutes": settings.wcda_deep_scan_lookback_minutes,
             "max_attempts": settings.message_max_attempts,
+            "llm_batch_messages": settings.llm_batch_messages,
             "watermark_sessions": len(states),
             "cursor_sessions": sum(1 for item in states if int(item.get("last_local_id") or 0) > 0),
             "pending_messages": self.db.count_unprocessed(),
@@ -764,6 +951,7 @@ class AppService:
             "last_ok_at": self._last_collect_ok_at,
             "states": states[-200:],
             "last": self._last_collection,
+            **self._collection_metrics(),
         }
 
     def catchup_state(self) -> dict:
@@ -847,7 +1035,11 @@ class AppService:
         """
         max_attempts = max(1, int(self.settings.message_max_attempts))
         outcome = {"processed": 0, "dead": [], "tasks_created": 0,
-                   "tasks_updated": 0, "dropped_other": 0, "failed": 0}
+                   "tasks_updated": 0, "dropped_other": 0, "failed": 0,
+                   # 降级/抽取饱和（P1-1/P1-2/P1-4）：由 process_batch 聚合上来
+                   "llm_batches": 0, "llm_fallbacks": 0, "cap_hits": 0,
+                   "messages_without_task": 0, "degraded_reasons": [],
+                   "failure_kind": None}
         by_id = {str(item.get("rawid") or ""): item for item in pending}
         try:
             stats = await self.process_batch(pending)
@@ -860,6 +1052,7 @@ class AppService:
                 failed_items = await self._isolate_messages(pending, outcome)
                 self._record_failure_attempts(failed_items, by_id, max_attempts, outcome)
                 outcome["failed"] = len(failed_items)
+                outcome["failure_kind"] = "partial_failure"
                 self._global_failure_streaks.pop(session_id, None)
                 return outcome
             # 大积压：先隔离探测前 N 条，区分「整体性故障」与「个别毒消息」
@@ -875,6 +1068,7 @@ class AppService:
                 streak = self._global_failure_streaks.get(session_id, 0) + 1
                 self._global_failure_streaks[session_id] = streak
                 outcome["failed"] = len(pending)
+                outcome["failure_kind"] = "sustained_failure"
                 if streak == 3 or streak % 10 == 0:
                     logger.warning("采集持续处理失败（%s，连续 %s 轮），升级告警：%s",
                                    session_id, streak, error)
@@ -885,6 +1079,7 @@ class AppService:
                 return outcome
             self._record_failure_attempts(failed_items, by_id, max_attempts, outcome)
             outcome["failed"] = len(failed_items)
+            outcome["failure_kind"] = "partial_failure"
             if outcome["processed"]:
                 self._global_failure_streaks.pop(session_id, None)
             return outcome
@@ -896,6 +1091,11 @@ class AppService:
         outcome["tasks_created"] = int(stats.get("tasks_created", 0))
         outcome["tasks_updated"] = int(stats.get("tasks_updated", 0))
         outcome["dropped_other"] = int(stats.get("dropped_other", 0))
+        outcome["llm_batches"] = int(stats.get("llm_batches") or 0)
+        outcome["llm_fallbacks"] = int(stats.get("llm_fallbacks") or 0)
+        outcome["cap_hits"] = int(stats.get("cap_hits") or 0)
+        outcome["messages_without_task"] = int(stats.get("messages_without_task") or 0)
+        outcome["degraded_reasons"] = list(stats.get("degraded_reasons") or [])
         return outcome
 
     async def _isolate_messages(self, messages: list[dict],
@@ -914,6 +1114,11 @@ class AppService:
             outcome["tasks_created"] += int(single.get("tasks_created", 0))
             outcome["tasks_updated"] += int(single.get("tasks_updated", 0))
             outcome["dropped_other"] += int(single.get("dropped_other", 0))
+            outcome["llm_batches"] += int(single.get("llm_batches") or 0)
+            outcome["llm_fallbacks"] += int(single.get("llm_fallbacks") or 0)
+            outcome["cap_hits"] += int(single.get("cap_hits") or 0)
+            outcome["messages_without_task"] += int(single.get("messages_without_task") or 0)
+            outcome["degraded_reasons"].extend(single.get("degraded_reasons") or [])
             self.db.mark_messages_processed([str(message.get("rawid") or "")])
         return failed
 
@@ -992,6 +1197,72 @@ class AppService:
                                bypass_quiet=True)
         except Exception as alert_error:  # noqa: BLE001 - 告警失败不影响采集/入库
             logger.warning("采集持续失败告警推送失败：%s", alert_error)
+
+    # ---------- LLM 降级 / 抽取饱和 告警（P1-1/P1-2） ----------
+    def _note_llm_success(self) -> None:
+        """任意一批 LLM 调用成功即视为恢复，重置“连续回退”计数与告警阈值。"""
+        if self._llm_fallback_streak:
+            self._llm_alert_next = self._LLM_ALERT_FIRST
+        self._llm_fallback_streak = 0
+
+    def _note_llm_fallback(self, error: Exception) -> None:
+        """记录一次 LLM 回退到规则模式；状态会在 collect 结果/health 里暴露。"""
+        detail = getattr(error, "detail", None) or f"{type(error).__name__}: {error}"
+        self.last_llm_error = str(detail)[:300]
+        self._llm_fallback_total += 1
+        self._llm_fallback_streak += 1
+        logger.warning("LLM 调用失败，已回退规则模式（连续第 %s 次）：%s",
+                       self._llm_fallback_streak, self.last_llm_error)
+
+    def _llm_alert_due(self) -> bool:
+        if self._llm_fallback_streak < self._llm_alert_next:
+            return False
+        return time.monotonic() - self._last_llm_alert_at >= self._LLM_ALERT_INTERVAL
+
+    async def _maybe_alert_llm_degraded(self, result: dict) -> None:
+        """LLM 持续不可用/上下文溢出时推送一次告警（限频，避免每批一条）。"""
+        if not result.get("llm_fallbacks") or not self._llm_alert_due():
+            return
+        self._last_llm_alert_at = time.monotonic()
+        self._llm_alert_next = self._llm_fallback_streak + self._LLM_ALERT_EVERY
+        body = (f"大模型调用连续失败 {self._llm_fallback_streak} 次，采集已自动回退本地规则模式。\n"
+                f"规则模式对模糊待办的召回明显低于大模型，待办可能变少/不准；"
+                f"消息不会丢，恢复后会自动继续用大模型。\n"
+                f"最近错误：{clip(self.last_llm_error or '', 160)}\n"
+                f"可在设置页「运行状态 → 采集」查看降级状态。")[:480]
+        logger.error("LLM 持续失败已回退规则模式（连续 %s 次）：%s",
+                     self._llm_fallback_streak, self.last_llm_error)
+        try:
+            await self._notify("微信待办 · 大模型不可用，已降级", body, priority="high",
+                               bypass_quiet=True)
+        except Exception as alert_error:  # noqa: BLE001 - 告警失败不影响采集/入库
+            logger.warning("LLM 降级告警推送失败：%s", alert_error)
+
+    async def _maybe_alert_extraction_cap(self, result: dict) -> None:
+        """抽取命中上限且大量消息没生成待办时提醒“可能漏建”（限频）。
+
+        上限（LLM 每批 8 事项/12 任务、规则每批 12 条）是设计容量；分片归并后仍命中时，
+        说明单批消息量依旧过大，需要让用户知道“这轮可能少建了待办”，而不是静默消费。
+        """
+        hits = int(result.get("extraction_cap_hits") or 0)
+        without = int(result.get("messages_without_task") or 0)
+        if hits <= 0 or (without < 10 and hits < 3):
+            return
+        if time.monotonic() - self._last_cap_alert_at < self._CAP_ALERT_INTERVAL:
+            return
+        self._last_cap_alert_at = time.monotonic()
+        body = (f"本轮有 {without} 条消息处理了但没有生成待办，"
+                f"其中 {hits} 批触发了抽取上限（每批最多 8 事项/12 任务）。\n"
+                f"如果是消息洪峰，建议调小 LLM_BATCH_MESSAGES（当前 "
+                f"{int(self.settings.llm_batch_messages)} 条/批）让每批更聚焦；"
+                f"若确认都是闲聊可忽略本提醒。\n"
+                f"也可在设置页「运行状态 → 采集」查看“抽取上限/未生成待办”计数。")[:480]
+        logger.warning("抽取命中上限，可能有待办漏建：cap_hits=%s messages_without_task=%s",
+                       hits, without)
+        try:
+            await self._notify("微信待办 · 有待办可能没提取全", body, priority="normal")
+        except Exception as alert_error:  # noqa: BLE001 - 告警失败不影响采集/入库
+            logger.warning("抽取上限提醒推送失败：%s", alert_error)
 
     async def _identity_for(self, session_id: str, group_name: str,
                             is_group: bool) -> IdentityContext:
@@ -1095,6 +1366,13 @@ class AppService:
             payload.append(event)
         return payload
 
+    def _llm_batches(self, messages: list[dict]) -> list[list[dict]]:
+        """按 LLM_BATCH_MESSAGES 把一轮消息切成多个归并批次（0 = 不切批）。"""
+        size = int(getattr(self.settings, "llm_batch_messages", 0) or 0)
+        if size <= 0 or len(messages) <= size:
+            return [messages]
+        return [messages[index:index + size] for index in range(0, len(messages), size)]
+
     async def _process_session_batch(self, session_id: str, messages: list[dict]) -> dict:
         group_name = (messages[-1].get("group_name") if messages else "") or ""
         is_group = bool(messages[-1].get("is_group", True)) if messages else True
@@ -1102,24 +1380,85 @@ class AppService:
         filtered, dropped_other = self._filter_messages(messages, identity)
         if not filtered:
             return {"messages": len(messages), "kept": 0, "tasks_created": 0, "tasks_updated": 0,
-                    "dropped_other": dropped_other}
+                    "dropped_other": dropped_other, "llm_batches": 0, "llm_fallbacks": 0,
+                    "cap_hits": 0, "messages_without_task": 0, "degraded_reasons": [],
+                    "covered_msg_ids": []}
         group_name = group_name or (filtered[-1].get("group_name") or "")
         last_ts = max(int(message.get("ts") or 0) for message in filtered)
         now = now_local()
 
         if self.settings.llm_enabled:
-            open_events = self._open_events_payload(session_id)
-            result = await llm_reconcile(filtered, open_events, self.settings, now, identity=identity)
-            if result is not None:
-                merge_stats = await self._merge_into_manual_tasks(filtered, result, now)
-                stats = await self._apply_reconcile(session_id, group_name, filtered, last_ts, result)
-                stats.update(merge_stats)
-                stats["dropped_other"] = dropped_other
-                return stats
+            stats = await self._llm_reconcile_batches(
+                session_id, group_name, filtered, last_ts, now, identity)
+            stats["dropped_other"] = dropped_other
+            return stats
 
         stats = await self._fallback_event(session_id, group_name, filtered, last_ts, now, identity)
         stats["dropped_other"] = dropped_other
         return stats
+
+    async def _llm_reconcile_batches(self, session_id: str, group_name: str,
+                                     messages: list[dict], last_ts: int, now,
+                                     identity: IdentityContext | None) -> dict:
+        """把一轮消息分片多次归并（P1-1），并统计回退/上限命中（P1-2）。
+
+        单次归并 prompt 明确「最多 8 个事项、总共最多 12 个任务」，洪峰下整批一次归并
+        会静默饱和；按 ``LLM_BATCH_MESSAGES`` 分片后每片独立归并、逐片更新事项账本，
+        片间仍可通过新写入的 open events 归并。某一片 LLM 失败时只回退该片到规则模式，
+        并把 ``llm_fallbacks``/``last_llm_error``/``degraded_reasons`` 暴露给采集结果。
+        """
+        totals = {
+            "messages": len(messages), "kept": len(messages),
+            "tasks_created": 0, "tasks_updated": 0, "events": 0,
+            "mode": "llm", "summary": "",
+            "llm_batches": 0, "llm_fallbacks": 0, "cap_hits": 0,
+            "messages_without_task": 0, "covered_msg_ids": [], "degraded_reasons": [],
+            "supplemented": 0, "suppressed": 0,
+        }
+        covered: set[str] = set()
+        summaries: list[str] = []
+        degraded: list[str] = []
+        for batch in self._llm_batches(messages):
+            open_events = self._open_events_payload(session_id)
+            try:
+                result = await llm_reconcile(batch, open_events, self.settings, now,
+                                             identity=identity)
+            except LLMUnavailable as error:
+                self._note_llm_fallback(error)
+                degraded.append("llm_fallback")
+                totals["llm_fallbacks"] += 1
+                result = None
+            if result is None:
+                # 该片回退规则模式；其余片仍然继续尝试大模型
+                stats = await self._fallback_event(session_id, group_name, batch, last_ts,
+                                                   now, identity)
+            else:
+                self._note_llm_success()
+                totals["llm_batches"] += 1
+                if getattr(result, "cap_hit", False):
+                    totals["cap_hits"] += 1
+                merge_stats = await self._merge_into_manual_tasks(batch, result, now)
+                stats = await self._apply_reconcile(session_id, group_name, batch, last_ts, result)
+                stats.update(merge_stats)
+            totals["tasks_created"] += int(stats.get("tasks_created") or 0)
+            totals["tasks_updated"] += int(stats.get("tasks_updated") or 0)
+            totals["events"] += int(stats.get("events") or 0)
+            totals["supplemented"] += int(stats.get("supplemented") or 0)
+            totals["suppressed"] += int(stats.get("suppressed") or 0)
+            covered.update(str(mid) for mid in (stats.get("covered_msg_ids") or []) if mid)
+            if stats.get("summary"):
+                summaries.append(str(stats["summary"]))
+            degraded.extend(stats.get("degraded_reasons") or [])
+        totals["mode"] = "llm" if totals["llm_batches"] else "rule"
+        totals["covered_msg_ids"] = sorted(covered)
+        totals["messages_without_task"] = max(0, len(messages) - len(covered))
+        totals["summary"] = "；".join(dict.fromkeys(summaries))[:400]
+        if totals["cap_hits"]:
+            degraded.append("extraction_cap")
+            logger.warning("LLM 归并命中抽取上限 %s 批（消息 %s 条，未生成待办 %s 条）",
+                           totals["cap_hits"], len(messages), totals["messages_without_task"])
+        totals["degraded_reasons"] = list(dict.fromkeys(degraded))
+        return totals
 
     @staticmethod
     def _match_reasons(messages: list[dict]) -> dict[str, str]:
@@ -1191,10 +1530,15 @@ class AppService:
             logger.info("新增 %s 项待办，更新 %s 项（模式 llm，事项 %s）",
                         len(created), updated, events_touched)
             await self.push_new_tasks(created, result.summary)
+        covered_ids = {
+            str(msg_id) for item in result.items for task in item.tasks
+            for msg_id in (task.source_msg_ids or []) if msg_id
+        }
         return {
             "messages": len(messages), "kept": len(messages),
             "tasks_created": len(created), "tasks_updated": updated,
             "events": events_touched, "mode": "llm", "summary": result.summary,
+            "covered_msg_ids": sorted(covered_ids),
         }
 
     # ---------- 手动待办：新建去重 / 自动补充 / 已忽略去重 ----------
@@ -1206,9 +1550,10 @@ class AppService:
         - 最近 MANUAL_SUPPRESS_DAYS 天内被忽略的手动待办：同一件事 → 丢弃新待办（suppress）；
         - 都不匹配 → 照常新建。
 
-        底线（与用户约定）：手动待办的标题、已有截止时间、已有备注一律不改；
-        只补它目前为空的字段，并追加来源消息便于追溯；已忽略的待办只用于抑制重复，
-        本身不被改写。返回 {"supplemented": n, "suppressed": m}。
+        底线（与用户约定）：手动待办的标题、已有备注不改；截止时间默认只补空，
+        但模型明确识别到改期/新的截止时间（supplement_due 非空）时覆盖已有时间；
+        并追加来源消息便于追溯；已忽略的待办只用于抑制重复，本身不被改写。
+        返回 {"supplemented": n, "suppressed": m}。
         """
         stats = {"supplemented": 0, "suppressed": 0}
         candidates: list[tuple[int, int, ReconcileTask]] = []
@@ -1291,18 +1636,25 @@ class AppService:
 
     def _supplement_manual(self, manual: dict, candidate: ReconcileTask, decision,
                            *, include_candidate: bool) -> None:
-        """把细节补进手动待办；include_candidate=True 时用新待办的旧字段兜底。"""
+        """把细节补进手动待办；include_candidate=True 时用新待办的旧字段兜底。
+
+        截止时间：模型明确给出 supplement_due（识别到改期/新时间）时允许覆盖手动已有时间；
+        只有兜底的 candidate.due_at 时仍只补空，避免“只是再次提到”就改掉用户填的时间。
+        """
         notes = decision.supplement_notes
-        due_at = decision.supplement_due
+        explicit_due = decision.supplement_due
+        due_at = explicit_due
         if include_candidate:
             notes = notes or clip(candidate.notes or "", 400)
-            due_at = due_at or candidate.due_at
+            if not due_at:
+                due_at = candidate.due_at
         _task, changed = self.db.supplement_task(
             manual["id"],
             due_at=due_at,
             notes=notes,
             source_msg_ids=list(candidate.source_msg_ids or []),
             match_reason="自动补充（来自新消息归并）",
+            overwrite_due=bool(explicit_due),
         )
         if changed:
             logger.info("手动待办已补充「%s」：%s",
@@ -1311,23 +1663,64 @@ class AppService:
     async def _fallback_event(self, session_id: str, group_name: str, messages: list[dict],
                               last_ts: int, now,
                               identity: IdentityContext | None = None) -> dict:
+        """规则模式抽取并落库（LLM 不可用 / 未配置时）。
+
+        P2-2：规则模式没有 LLM 的归并能力，同一事项换个说法在多条消息/多轮里会重复建
+        待办。这里在落库前用 ``titles_similar`` 与**该会话仍打开事项里的待办**比对：
+        相似则把来源消息并入已有待办、只补空白字段；事项也优先复用标题相似的事项，
+        不再每轮新建一个重复事项。
+        """
         names = list(dict.fromkeys(
             list(identity.aliases if identity else []) + list(self.settings.me_names or [])
         ))
-        result = rule_extract(messages, self.settings, now, me_names=names)
+        result = rule_extract(messages, self.settings, now, me_names=names,
+                              max_tasks=self._RULE_MAX_TASKS)
+        cap_hits = 1 if getattr(result, "cap_hit", False) else 0
         if not result.tasks:
             return {"messages": len(messages), "kept": len(messages),
-                    "tasks_created": 0, "tasks_updated": 0, "mode": "rule"}
-        title = result.tasks[0].title or "微信事项"
-        event = self.db.create_event(
-            session_id=session_id, group_name=group_name,
-            title=title, summary=result.summary, last_msg_ts=last_ts,
-        )
+                    "tasks_created": 0, "tasks_updated": 0, "mode": "rule",
+                    "cap_hits": cap_hits, "covered_msg_ids": [],
+                    "messages_without_task": len(messages)}
+        open_events = self._open_events_payload(session_id)
+        existing: list[tuple[dict, dict]] = [
+            (event, task) for event in open_events for task in (event.get("tasks") or [])
+        ]
         reasons = self._match_reasons(messages)
         created: list[dict] = []
+        covered: set[str] = set()
+        event: dict | None = None
         for task in result.tasks:
             source_ids = [msg_id for msg_id in task.source_msg_ids if msg_id]
+            covered.update(source_ids)
             match_reason = next((reasons[msg_id] for msg_id in source_ids if msg_id in reasons), "")
+
+            duplicate = next(((ev, row) for ev, row in existing
+                              if titles_same_topic(task.title, row.get("title") or "",
+                                                   task.due_at, row.get("due_at"))), None)
+            if duplicate is not None:
+                dup_event, dup_task = duplicate
+                fields = {}
+                if not dup_task.get("notes"):
+                    fields["notes"] = clip(task.notes or "", 400)
+                if not dup_task.get("due_at") and task.due_at:
+                    fields["due_at"] = task.due_at
+                if fields:
+                    self.db.update_task(dup_task["id"], fields)
+                self.db.merge_task_sources(dup_task["id"], source_ids)
+                logger.info("规则模式去重：新消息并入已有待办「%s」（不重复建）",
+                            clip(dup_task.get("title") or "", 30))
+                continue
+
+            if event is None:
+                event = next((ev for ev in open_events
+                              if titles_same_topic(task.title, ev.get("title") or "")), None)
+                if event is None:
+                    title = task.title or "微信事项"
+                    event = self.db.create_event(
+                        session_id=session_id, group_name=group_name,
+                        title=title, summary=result.summary, last_msg_ts=last_ts,
+                    )
+                    open_events.append({**event, "tasks": []})
             row, is_new = self.db.create_task(
                 title=task.title, notes=task.notes, due_at=task.due_at,
                 priority=task.priority, group_name=group_name,
@@ -1337,12 +1730,15 @@ class AppService:
             )
             if is_new:
                 created.append(row)
+                existing.append((event, row))
         if created:
             logger.info("新增 %s 项待办（规则模式）", len(created))
             await self.push_new_tasks(created, result.summary)
         return {"messages": len(messages), "kept": len(messages),
                 "tasks_created": len(created), "tasks_updated": 0,
-                "mode": "rule", "summary": result.summary}
+                "mode": "rule", "summary": result.summary,
+                "cap_hits": cap_hits, "covered_msg_ids": sorted(covered),
+                "messages_without_task": max(0, len(messages) - len(covered))}
 
     async def process_batch(self, messages: list[dict]) -> dict:
         """兼容入口：把消息按会话分组后分别走事件账本。"""
@@ -1351,6 +1747,8 @@ class AppService:
             groups.setdefault(str(message.get("session_id") or ""), []).append(message)
         total_created = total_updated = total_kept = total_dropped = total_supplemented = 0
         total_suppressed = 0
+        total_batches = total_fallbacks = total_cap = total_without = 0
+        degraded_reasons: list[str] = []
         last_mode = "rule"
         last_summary = ""
         for session_id, session_messages in groups.items():
@@ -1363,12 +1761,20 @@ class AppService:
             total_dropped += stats.get("dropped_other", 0)
             total_supplemented += stats.get("supplemented", 0)
             total_suppressed += stats.get("suppressed", 0)
+            total_batches += int(stats.get("llm_batches") or 0)
+            total_fallbacks += int(stats.get("llm_fallbacks") or 0)
+            total_cap += int(stats.get("cap_hits") or 0)
+            total_without += int(stats.get("messages_without_task") or 0)
+            degraded_reasons.extend(stats.get("degraded_reasons") or [])
             last_mode = stats.get("mode", last_mode)
             last_summary = stats.get("summary", last_summary)
         return {"messages": len(messages), "kept": total_kept,
                 "tasks_created": total_created, "tasks_updated": total_updated,
                 "supplemented": total_supplemented, "suppressed": total_suppressed,
                 "dropped_other": total_dropped,
+                "llm_batches": total_batches, "llm_fallbacks": total_fallbacks,
+                "cap_hits": total_cap, "messages_without_task": total_without,
+                "degraded_reasons": list(dict.fromkeys(degraded_reasons)),
                 "mode": last_mode, "summary": last_summary}
 
     # ---------- 推送 ----------
@@ -1517,6 +1923,7 @@ class AppService:
             "deep_scan_minutes": self.settings.wcda_deep_scan_minutes,
             "deep_scan_lookback_minutes": self.settings.wcda_deep_scan_lookback_minutes,
             "max_attempts": self.settings.message_max_attempts,
+            "llm_batch_messages": self.settings.llm_batch_messages,
             "watermarks": len(states),
             # 已建立 localId 游标的会话数（localId 增量是本轮采集的主依据）
             "cursor_sessions": sum(1 for item in states if int(item.get("last_local_id") or 0) > 0),
@@ -1527,6 +1934,8 @@ class AppService:
             "failed_sessions": failed_sessions,
             "last_ok_at": self._last_collect_ok_at,
             "last": self._last_collection,
+            # 降级/抽取饱和/分页读取放大（P1-1/P1-2/P1-4/P2-3/P2-4）
+            **self._collection_metrics(),
         }
         return {
             "ok": True,

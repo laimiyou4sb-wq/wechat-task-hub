@@ -94,8 +94,9 @@ def should_keep(content: str, me_names: list[str] | None = None) -> bool:
     # 只有链接
     if re.fullmatch(r"https?://\S+", text):
         return False
-    # 明确的“闲聊/已结束”信号
-    if any(item in text for item in NOISE_CONTAINS):
+    # 明确的“闲聊/已结束”信号；但若正文里同时带着动作/时间/截止/@我，
+    # 说明只是顺带说了句“收到/已满”，正事不能整条丢掉（P2-1）
+    if any(item in text for item in NOISE_CONTAINS) and not _has_task_signal(text, me_names):
         return False
     # 以“吗/呢/吧”结尾且没有时间/截止/@我：大概率是提问或闲聊
     if (re.search(r"[吗呢吧]\s*[。！!？?…]*$", text)
@@ -137,7 +138,7 @@ def should_send_to_llm(content: str, me_names: list[str] | None = None) -> bool:
         return False
     if re.fullmatch(r"https?://\S+", text):
         return False
-    if any(item in text for item in NOISE_CONTAINS):
+    if any(item in text for item in NOISE_CONTAINS) and not _has_task_signal(text, me_names):
         return False
     return True
 
@@ -155,6 +156,16 @@ def has_time_signal(content: str) -> bool:
 def has_deadline_signal(content: str) -> bool:
     text = content or ""
     return any(keyword in text for keyword in DEADLINE_WORDS)
+
+
+def _has_task_signal(content: str, me_names: list[str] | None = None) -> bool:
+    """正文里是否还带着“要做的事”的信号（动作/时间/截止/@我）。
+
+    噪音词是子串匹配（“收到”“已满”“结束了”…），单独出现才是噪音；
+    如果同一条消息还带着待办信号，就交给后面的规则/模型判断，不能按噪音整条过滤。
+    """
+    return (has_action_hint(content) or has_time_signal(content)
+            or has_deadline_signal(content) or mentions_me(content, me_names))
 
 
 def importance(content: str, me_names: list[str] | None = None) -> int:

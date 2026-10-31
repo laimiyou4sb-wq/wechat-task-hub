@@ -188,10 +188,12 @@ def test_monitored_sessions_follow_pin_changes(tmp_path):
     service = AppService(_settings(tmp_path, whitelist_mode="pinned"))
     fake = FakeWcda(sessions, {})
     service.wcda = fake
-    targets = asyncio.run(service._monitored_sessions())
+    targets, error = asyncio.run(service._monitored_sessions())
+    assert error is None
     assert {item["session_id"] for item in targets} == {"a@chatroom", "b@chatroom"}
 
     fake._sessions = [{"username": "a@chatroom", "name": "A群", "isGroup": True, "isTop": False}]
-    targets = asyncio.run(service._monitored_sessions())
+    targets, error = asyncio.run(service._monitored_sessions())
+    assert error is None
     assert {item["session_id"] for item in targets} == set()
     service.db.close()

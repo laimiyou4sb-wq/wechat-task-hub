@@ -1,6 +1,7 @@
 """把一批微信消息归纳成待办任务：优先大模型，失败回退本地规则。"""
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import logging
@@ -14,6 +15,39 @@ from .identity import IdentityContext
 from .utils import clip, now_local, now_iso, parse_iso, strip_urls
 
 logger = logging.getLogger(__name__)
+
+
+class LLMUnavailable(RuntimeError):
+    """大模型调用不可用（网络/额度/上下文溢出/输出格式）。
+
+    调用方据此降级到规则模式，并把 detail/kind 写进 last_llm_error 与健康状态。
+    kind: context_limit（上下文溢出）| format（输出格式不对）| llm_error（其它）。
+    """
+
+    def __init__(self, detail: str, *, kind: str = "llm_error") -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.kind = kind
+
+
+_CONTEXT_LIMIT_HINTS = (
+    "context_length", "context length", "maximum context", "context window",
+    "token limit", "too many tokens", "max_tokens", "reduce the length",
+    "上下文",
+)
+_FORMAT_HINTS = ("json", "expecting value", "unterminated string", "格式")
+
+
+def _llm_error_kind(error: Exception) -> str:
+    """按异常类型/文本判断 LLM 失败类别，供上层区分“上下文溢出/格式错误/其它”。"""
+    if isinstance(error, json.JSONDecodeError):
+        return "format"
+    text = f"{error.__class__.__name__} {error}".lower()
+    if any(hint in text for hint in _CONTEXT_LIMIT_HINTS):
+        return "context_limit"
+    if any(hint in text for hint in _FORMAT_HINTS):
+        return "format"
+    return "llm_error"
 
 
 @dataclass
@@ -41,6 +75,8 @@ class ExtractResult:
     summary: str
     tasks: list[ExtractedTask]
     mode: str = "rule"
+    # 规则模式触到 12 条上限被截断（上层据此上报“可能漏建”）
+    cap_hit: bool = False
 
 
 WEEKDAYS = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
@@ -77,6 +113,79 @@ def _apply_period(hour: int, text: str) -> int:
 def _dedupe_key(title: str, due_at: str | None, group_name: str) -> str:
     raw = f"{title.strip().lower()}|{due_at or ''}|{group_name or ''}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# 标题归一化 + 相似判定：规则模式没有模型归并能力，同一件事被反复提醒
+# （“报名请填写…” / “再提醒一次：填写…”）会重复建待办，这里做保守的批内去重。
+# 原则：宁可不合并，也不能把两件不同的事并掉。
+# ---------------------------------------------------------------------------
+# 标题里的口头虚词（按长度从长到短替换，避免“收到请回复”被“收到”截断）
+TITLE_FILLER_WORDS = (
+    "收到请回复", "再提醒一次", "再提醒", "提醒一下", "提醒", "记得", "请",
+    "一下", "大家", "同学们", "同学", "各位", "务必", "谢谢", "收到", "麻烦",
+)
+# 标点/空白/括号/分隔符：只用于比较，不影响展示
+_TITLE_NOISE_CHARS = re.compile(
+    r"[\s【】\[\]（）()<>《》〈〉「」『』，。,.!！?？:：;；/\\、\-—–－…\"'“”‘’~～·|]+"
+)
+
+
+def normalize_title(title: str) -> str:
+    """标题归一化：去空白/标点/口头虚词，用于相似度比较（不用于展示）。"""
+    text = _TITLE_NOISE_CHARS.sub("", title or "")
+    for word in TITLE_FILLER_WORDS:
+        text = text.replace(word, "")
+    return text.strip().lower()
+
+
+def titles_similar(left: str, right: str) -> bool:
+    """判断两个标题是否在说同一件事（保守判定）。"""
+    a = normalize_title(left)
+    b = normalize_title(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    # 一方完整包含另一方：要求被包含的那一方足够长（>=4），避免短词误合并
+    if (a in b or b in a) and min(len(a), len(b)) >= 4:
+        return True
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.72
+
+
+def titles_same_topic(left: str, right: str, left_due: str | None = None,
+                      right_due: str | None = None) -> bool:
+    """更严格的“同一件事”判定，供规则模式批内/跨轮去重使用。
+
+    ``titles_similar`` 的模糊相似（ratio>=0.72）对短标题偏松，可能把
+    “报名A活动 / 报名B活动”并成一件。这里在相似之上加约束：
+
+    - 两边的明确截止时间不是同一天 → 不是同一件事；
+    - 没有可解析截止时间时，只接受归一化后相同或包含（不做模糊相似）；
+    - 都有截止且同一天时才接受模糊相似，但两条标题里的数字序列必须一致
+      （避免把“提交第1份表格 / 提交第2份表格”这类同一天的不同事项并掉）。
+    """
+    if not titles_similar(left, right):
+        return False
+    if left_due and right_due and str(left_due)[:10] != str(right_due)[:10]:
+        return False
+    a = normalize_title(left)
+    b = normalize_title(right)
+    if a and b and (a == b or ((a in b or b in a) and min(len(a), len(b)) >= 4)):
+        return True
+    if not (left_due and right_due and str(left_due)[:10] == str(right_due)[:10]):
+        return False
+    # 同一天 + 模糊相似：数字序列不同（第1份 vs 第2份、A场 vs B场编号）视为不同事项
+    return re.findall(r"\d+", a) == re.findall(r"\d+", b)
+
+
+def _due_compatible(left: str | None, right: str | None) -> bool:
+    """截止时间是否兼容：都没有截止，或落在同一天。"""
+    if not left and not right:
+        return True
+    if not left or not right:
+        return False
+    return left[:10] == right[:10]
 
 
 def _extract_time(text: str) -> tuple[int, int] | None:
@@ -197,13 +306,21 @@ def _action_title(content: str, title: str) -> str:
 
 
 def rule_extract(messages: list[dict], settings: Settings, now: datetime | None = None,
-                 me_names: list[str] | None = None) -> ExtractResult:
+                 me_names: list[str] | None = None,
+                 max_tasks: int = 12) -> ExtractResult:
+    """规则模式抽取。
+
+    ``max_tasks``：单批最多产出多少条待办（0 = 不限制）。调用方（采集链路）应按
+    会话消息量传更大的值，否则洪峰下每批 12 条会静默饱和（见压力实验 P1-1）；
+    这里仍保留上限作为防噪兜底，并只在**确实还有值得建待办的消息没处理**时置 cap_hit。
+    """
     now = now or now_local()
     names = list(dict.fromkeys(list(me_names or []) + list(settings.me_names or [])))
     tasks: list[ExtractedTask] = []
     seen: dict[str, ExtractedTask] = {}
+    cap_hit = False
 
-    for message in messages:
+    for index, message in enumerate(messages):
         content = (message.get("content") or "").strip()
         if not content or not is_worth_summarizing(content, names):
             continue
@@ -225,6 +342,18 @@ def rule_extract(messages: list[dict], settings: Settings, now: datetime | None 
         if key in seen:
             seen[key].source_msg_ids.append(message.get("rawid", ""))
             continue
+        # 批内相似去重：没有模型归并时，“报名请填写…”与“再提醒一次：填写…”会重复建待办；
+        # 标题足够相似且截止时间兼容时并入已有任务，只补来源消息（保守，避免误合并）。
+        merged = False
+        for existing in tasks:
+            if not titles_same_topic(title, existing.title, due, existing.due_at):
+                continue
+            existing.source_msg_ids.append(message.get("rawid", ""))
+            seen[key] = existing
+            merged = True
+            break
+        if merged:
+            continue
         task = ExtractedTask(
             title=title,
             notes=clip(content, 400),
@@ -235,15 +364,21 @@ def rule_extract(messages: list[dict], settings: Settings, now: datetime | None 
         )
         seen[key] = task
         tasks.append(task)
-        if len(tasks) >= 12:
+        if max_tasks and len(tasks) >= max_tasks:
+            # 只有后面还有值得建待办的消息，才说明这一批真的被上限截断（可能漏建）
+            cap_hit = any(
+                is_worth_summarizing((item.get("content") or "").strip(), names)
+                for item in messages[index + 1:]
+            )
             break
 
     summary = f"本批 {len(messages)} 条消息，筛出 {len(tasks)} 项待办" if tasks else "本批消息无明确待办"
-    return ExtractResult(summary=summary, tasks=tasks, mode="rule")
+    return ExtractResult(summary=summary, tasks=tasks, mode="rule", cap_hit=cap_hit)
 
 
 LLM_SYSTEM_PROMPT = """你是用户的微信消息助理，负责把群聊消息整理成少量、可执行的待办任务。
 只创建需要用户本人执行或跟进、且能落到具体动作的事项；单纯的提醒、规范、着装/纪律说明、背景解释不是任务。
+信息不全不等于不是待办：能看出是在提醒/要求做一件具体的事，只是缺时间、缺对象、用代词、没点名时，按「低置信度待办」建 task（priority=low，notes 开头标注 [低置信度:原因]，due 不编造），不要直接丢弃。
 只输出 JSON，不要输出解释。"""
 
 
@@ -278,6 +413,8 @@ def _build_llm_prompt(messages: list[dict], now: datetime) -> str:
 
 要求：
 - 最多 8 条；宁缺毋滥，没有明确行动就返回空数组；
+- 信息不全（缺时间/缺对象/缺执行人/指代/改期）不等于不是待办：能看出在做具体事就建，priority 用 low，notes 开头标注 [低置信度:原因]，due 不编造；
+- 纯提醒/规范类仍然不算任务；
 - 不编造原文没有的信息；
 - 时间要结合“现在时间”推算（如“明天下午3点”“本周五前”）。"""
 
@@ -378,6 +515,10 @@ class ReconcileResult:
     items: list[ReconcileItem]
     summary: str = ""
     mode: str = "llm"
+    # 上限可观测：本轮模型输出是否触到 8 事项/12 任务上限（可能被截断）
+    cap_hit: bool = False
+    items_returned: int = 0
+    tasks_returned: int = 0
 
 
 def task_dedupe_key(task: ExtractedTask) -> str:
@@ -389,7 +530,7 @@ RECONCILE_SYSTEM_PROMPT = """你是微信「事项账本」助手。你的任务
 只创建「需要我本人执行/跟进」的任务：明确 @ 别人、点名别人负责或去做的，不要输出。
 群里的填表/接龙/报名/统计人数，以及要求报名/参加/集合的活动通知，只要需要我参与或完成，也要建待办（不必被 @）。
 务必区分「任务」和「提醒/规范」：只说明规则、纪律、着装、礼仪、注意事项或原因背景，或提醒大家“注意/别做某事/以后如何”的消息，不是任务，不要生成 task。
-拿不准是否要我执行时，宁可不建，也不要把提醒当成待办。
+纯提醒/规范类不建；但如果消息是在提醒/要求做一件具体的事（例如“记得把材料带过去”“那件事别忘了”“例会改到周五”），只是缺时间/缺对象/用代词/没点名，不要丢弃：按 user 提示里的「低置信度待办」规则建 low 任务，并在 notes 开头标注原因。
 任务不要求有截止时间：没有写时间的任务也要建（due 留空），不要因为缺少截止日期就放过。
 只输出 JSON，不要输出解释。"""
 
@@ -471,7 +612,7 @@ def _build_reconcile_prompt(messages: list[dict], events: list[dict], now: datet
   - 「因为前两天有人穿会服去做志愿，所以提醒下」
   - 「会服一般只有开全体大会要穿，平时出志愿不用穿」
   - 「这几天出志愿也是，着装得体，不穿拖鞋，其他没有要求的」
-- 判断任务的最低门槛：有明确动作（填写/报名/参加/提交/集合/领取/缴费/联系/确认…），且能说清“要做什么/交什么/去哪”；**不要求有截止时间或具体时间**——原文没写时间也照建，due 填 null，不要因为缺少截止日期就不建；
+- 判断任务的最低门槛：能看出是在提醒/要求做一件具体的事（填写/报名/参加/提交/集合/领取/缴费/联系/确认/带/交/改…），或出现“记得/别忘了/改到/延到/有空/那个”这类指向具体动作的提醒；**不要求有截止时间或具体时间**——原文没写时间也照建，due 填 null，不要因为缺少截止日期就不建；对象/执行人不清楚时按下面「低置信度待办」处理，不要因此不建；
 - 只是“提到”某类活动（如志愿服务、聚餐、培训），但没有让我报名/参加/集合，不算任务。
 
 # 召回要求（以前容易漏，务必注意）
@@ -480,6 +621,23 @@ def _build_reconcile_prompt(messages: list[dict], events: list[dict], now: datet
 - 链接卡片按标题理解：标题含 报名/统计/问卷/表格/接龙/活动/培训/会议/面试/人数/登记 等，视为“要填/要报名/要参加”；
 - 面向「大家/同学们/全体」的报名/填写/参加/集合类通知，assignee 填 me（我可能需要参与），不要填 other；纯提醒/规范不算；
 - 以上同一件事如果已有任务，只更新，不新建重复任务。
+
+# 低置信度待办（信息不全/指代不明/没点名时不要丢）
+- 上面「不要建待办」的排除项只针对：纯规则/纪律/着装/礼仪/背景解释，或完全看不出要做什么的闲聊、广告、表情。
+- 只要消息是在提醒/要求做一件具体的事，即使缺时间、缺对象、用代词、没写谁做、口语改期，也不能当闲聊丢掉；要建「低置信度待办」：priority 填 low，notes 开头写「[低置信度:原因]」。
+  - 缺截止时间 → due 填 null，不要编造；缺地点/人名同理留空；
+  - 没点名/面向大家/没主语 → assignee 填 me 或 unclear，不要填 other；
+  - 对象用代词/省略（“那个表”“第2件”“老时间”“照旧”“还是那个”）→ 先在该会话仍打开的事项/任务里找对应项：找到就用 event_id/task_id 更新，不新建重复任务；
+  - 找不到也照建：标题写能看出来的动作（如“跟进第2项安排”“确认例会改期”“提交材料”），notes 保留原文关键句并开头标注原因；
+  - 口头改期/变更（改到/延到/推后/提前/取消）→ 能对上已有任务就更新 due/notes；对不上就建“确认…改期/变更”的低置信度待办，不要直接丢；
+  - 要求我回复/确认（例如“收到请回复”“明天前回复我确认”）→ 若回复本身是给我的行动，建“回复确认…”待办，不要只因为出现“收到/回复”就当闲聊。
+- 正例（信息不全也要建，低置信度即可）：
+  - 「就按昨天说的第1件事来，别忘了」→ 跟进第1项安排（[低置信度:指代不明]）
+  - 「那第2个还是老时间」→ 跟进第2项安排（[低置信度:缺对象]）
+  - 「明天上午把第3批材料带到办公室」→ 带材料到办公室（[低置信度:缺执行人]）
+  - 「第1次例会改到周五下午了」→ 确认例会改期（[低置信度:疑似改期]）
+  - 「有空把第2项材料交了」→ 提交第2项材料（[低置信度:缺截止]）
+- 反向限制：纯提醒/规范（不要求具体动作）仍不要建；低置信度任务要克制，只保留“看得出是在提醒/安排具体动作”的，不要把寒暄、表情、广告、纯背景说明也建进来。
 
 输出 JSON（不要 markdown）：
 {{
@@ -510,8 +668,13 @@ def _build_reconcile_prompt(messages: list[dict], events: list[dict], now: datet
 - assignee 表示这件事实际要谁做：要我/我参与 → me；明确是别人 → other；拿不准 → unclear（不要轻易填 other）；
 - 最多 8 个事项、总共最多 12 个任务；
 - 没有截止时间的任务照常输出（due 填 null），不能因为“缺时间”而不建；
-- 宁可少建：提醒/规范类，或拿不准是否需要我执行的内容，一律不建任务；
-- 不编造原文没有的信息；没有可执行任务的事项不要输出。"""
+- 宁可少建：纯提醒/规范类不建；但“疑似给我的待办但缺要素”不能一律不建，按「低置信度待办」建 low 任务并标注；
+- 低置信度任务必须把对应消息放进 source_msg_ids，方便详情页回溯原文；
+- 低置信度任务的标题可以概括原文，但 notes 必须保留原文关键句；不得编造 due、地点、人名；没有可执行任务的事项不要输出。
+- 输出前自检（逐条核对，不得跳过）：
+  1) 本轮每条消息是否要么归入某个 task 的 source_msg_ids，要么明确属于闲聊/广告/纯表情/纯规范？
+  2) 含「记得/别忘了/别忘/改到/延到/推后/提前/有空/那个/这件/第N/照旧/老时间/回复/确认」的消息是否都已处理？漏掉的按「低置信度待办」补上。
+  3) 低置信度任务的 notes 是否以「[低置信度:原因]」开头、priority=low、没有编造字段？"""
 
 
 def _explicit_message_ids(messages: list[dict]) -> set[str]:
@@ -531,6 +694,15 @@ def _normalize_reconcile(data: dict, messages: list[dict], events: list[dict],
     raw_items = data.get("items")
     if not isinstance(raw_items, list):
         return None
+    # 上限可观测：统计模型「原始输出」的事项/任务数，达到 8 事项或 12 任务上限
+    # 说明本轮可能被截断（上层据此上报“可能漏建”）。
+    raw_items_count = len(raw_items)
+    raw_tasks_count = 0
+    for raw_item in raw_items:
+        raw_tasks = raw_item.get("tasks") if isinstance(raw_item, dict) else None
+        if isinstance(raw_tasks, list):
+            raw_tasks_count += len(raw_tasks)
+    cap_hit = raw_items_count >= 8 or raw_tasks_count >= 12
     message_ids = [str(message.get("rawid") or "") for message in messages]
     valid_event_ids = {str(event.get("id")) for event in events if event.get("id")}
     task_event_map = {
@@ -593,8 +765,12 @@ def _normalize_reconcile(data: dict, messages: list[dict], events: list[dict],
             tasks=tasks,
         ))
     if not items:
-        return ReconcileResult(items=[], summary=str(data.get("summary") or "").strip(), mode="llm")
-    return ReconcileResult(items=items, summary=str(data.get("summary") or "").strip(), mode="llm")
+        return ReconcileResult(items=[], summary=str(data.get("summary") or "").strip(), mode="llm",
+                               cap_hit=cap_hit, items_returned=raw_items_count,
+                               tasks_returned=raw_tasks_count)
+    return ReconcileResult(items=items, summary=str(data.get("summary") or "").strip(), mode="llm",
+                           cap_hit=cap_hit, items_returned=raw_items_count,
+                           tasks_returned=raw_tasks_count)
 
 
 async def llm_reconcile(messages: list[dict], events: list[dict], settings: Settings,
@@ -623,7 +799,9 @@ async def llm_reconcile(messages: list[dict], events: list[dict], settings: Sett
         data = json.loads(content)
     except Exception as error:
         logger.warning("LLM 事项归并失败，回退规则模式: %s", error)
-        return None
+        # 不再静默 return None：把失败类型/详情抛给上层，用于降级告警与 health 展示
+        raise LLMUnavailable(str(error) or error.__class__.__name__,
+                             kind=_llm_error_kind(error)) from error
     return _normalize_reconcile(data, messages, events, now, identity)
 
 
@@ -643,7 +821,8 @@ def is_duplicate_title(tasks: list[ExtractedTask], candidate: ExtractedTask) -> 
 #   - suppress：新待办就是用户最近「忽略」过的那件事 → 直接丢弃，不再新建
 #               （只抑制新建，不改写已忽略任务；窗口外/新一期活动仍照常新建）；
 #   - none    ：无关/拿不准 → 照常新建。
-# 底线：手动待办的标题 / 已有截止时间绝不改，补充只写空白字段。
+# 底线：手动待办的标题绝不改，备注默认只补空；截止时间默认只补空，
+# 但模型明确识别到「改期/新的截止时间」时允许覆盖（supplement_due 非空）。
 # ---------------------------------------------------------------------------
 MANUAL_MATCH_SYSTEM_PROMPT = """你是微信待办的「手动待办合并判定器」，负责判断模型新生成的待办是否与用户手动添加（或已忽略）的待办是同一件事。
 只输出 JSON，不要输出解释。"""
@@ -708,7 +887,7 @@ def _build_manual_match_prompt(candidates: list[ExtractedTask], manual_tasks: li
 """
     return f"""现在时间：{now.strftime('%Y-%m-%d %H:%M')}。
 
-# 用户手动添加的待办（只能补空白字段；标题、已有截止时间禁止修改）
+# 用户手动添加的待办（标题不可改；默认只补空，明确改期时可用 supplement_due 覆盖截止时间）
 {_format_manual_tasks(manual_tasks)}
 {ignored_block}
 # 模型本轮新生成的待办（待判定，编号 c0、c1…）
@@ -734,9 +913,11 @@ def _build_manual_match_prompt(candidates: list[ExtractedTask], manual_tasks: li
 例3：手动待办「科创破冰」+ 新待办「长江大讲堂报名」→ none；
 例4：已忽略「青马工程报名」+ 新待办「青马工程报名截止提醒」→ suppress；
 例5：已忽略「青马工程报名」+ 新待办「下期青马工程开始报名」→ none（新一期，照常新建）。
+例6：手动待办「科创破冰」（已填截止 11月1日 18:00）+ 新待办「破冰改到11月1日下午2点」→ same，supplement_due「2026-11-01 14:00」（允许覆盖手动已有时间）。
 
 补充规则（必须遵守）：
-- 手动待办的标题和已有的截止时间绝对不能改；只能补它目前为空的字段；
+- 手动待办的标题绝对不能改；备注只补空；
+- 截止时间默认只补空，但如果本轮消息明确给出新的截止时间/改期（例如“改到11月1日下午2点”“延期到周五”“时间改到晚上8点”），必须把 supplement_due 填成新时间，覆盖手动已有的截止时间；只是再次提到旧时间/没有新时间时填 null，不要用候选或旧值覆盖；
 - 补充备注只写原文里有依据的信息（时间/地点/要求），不要编造；
 - split 的 remainder 只写「不属于手动待办」的那部分，标题动词开头、不超过 20 字；
 - suppress 不写 supplement_notes / supplement_due，也不要引用未完成的手动待办；
@@ -750,7 +931,7 @@ def _build_manual_match_prompt(candidates: list[ExtractedTask], manual_tasks: li
       "relation": "same | split | none | suppress",
       "manual_task_id": "same/split 填对应手动待办 task_id；suppress 填对应已忽略待办 task_id；none 时留空",
       "supplement_notes": "要补进手动待办的细节；没有就留空",
-      "supplement_due": "要补进手动待办的截止时间 YYYY-MM-DD HH:MM；没有或手动已有截止时间就填 null",
+      "supplement_due": "要写入手动待办的截止时间 YYYY-MM-DD HH:MM；本轮消息明确给出新时间/改期就填（可覆盖手动已有时间）；没有新时间就填 null（不要填旧时间）",
       "remainder": {{
         "title": "split 时：不属于手动待办的那件事",
         "notes": "关键信息",

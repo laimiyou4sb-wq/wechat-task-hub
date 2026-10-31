@@ -39,10 +39,15 @@ class WcdaClient:
         except Exception:
             return False
 
-    async def fetch_sessions(self, limit: int = 500) -> list[dict]:
-        """获取会话列表（含 isTop / isGroup），用于置顶白名单。"""
+    async def fetch_sessions_result(self, limit: int = 500) -> dict:
+        """获取会话列表，并显式区分「接口失败」与「真的没有会话」。
+
+        返回 ``{"ok": bool, "sessions": list[dict], "error": str | None}``。接口失败
+        （网络异常 / HTTP 非 2xx / 响应解析失败）时 ``ok=False``：上层据此标记
+        connected/last_error，避免把失败当成空列表、采集静默空转（P1-3）。
+        """
         if not self.configured:
-            return []
+            return {"ok": False, "sessions": [], "error": "not_configured"}
         params: dict = {"limit": max(1, min(limit, 2000))}
         if self.account:
             params["account"] = self.account
@@ -53,10 +58,22 @@ class WcdaClient:
                                             headers={"Accept": "application/json"})
                 response.raise_for_status()
                 payload = response.json()
-                return [s for s in (payload.get("sessions") or []) if isinstance(s, dict)]
+                sessions = [s for s in (payload.get("sessions") or [])
+                            if isinstance(s, dict)]
         except Exception as error:
             logger.warning("读取 WeChatDataAnalysis 会话列表失败：%s", error)
-            return []
+            return {"ok": False, "sessions": [],
+                    "error": f"{type(error).__name__}: {error}"[:200]}
+        return {"ok": True, "sessions": sessions, "error": None}
+
+    async def fetch_sessions(self, limit: int = 500) -> list[dict]:
+        """获取会话列表（含 isTop / isGroup），用于置顶白名单。
+
+        兼容旧调用：失败仍返回 []；需要区分失败与空列表的调用方请改用
+        :meth:`fetch_sessions_result`。
+        """
+        result = await self.fetch_sessions_result(limit=limit)
+        return result["sessions"]
 
     # ---------- 身份识别相关（见 app/identity.py） ----------
     async def fetch_current_account(self) -> str:

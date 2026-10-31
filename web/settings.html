@@ -420,14 +420,43 @@
                   <span>失败会话</span>
                   <strong id="statusFailedSessions">—</strong>
                 </div>
+                <div class="caldav-meta-item">
+                  <span>采集降级</span>
+                  <strong id="statusDegraded">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>LLM 分片/回退</span>
+                  <strong id="statusLlmFallback">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>抽取上限</span>
+                  <strong id="statusCapHits">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>未生成待办</span>
+                  <strong id="statusMessagesWithoutTask">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>上次深扫</span>
+                  <strong id="statusDeepScanLast">—</strong>
+                </div>
+                <div class="caldav-meta-item">
+                  <span>分页读取放大</span>
+                  <strong id="statusReadAmplification">—</strong>
+                </div>
               </div>
               <p id="statusCatchupLast" class="hint-line">上次采集：尚未执行</p>
               <p class="hint-line">
                 采集全自动运行：启动 8 秒后先按 localId 游标采集一次，之后每轮按游标续采
                 （首次建立游标时按时间水位回看，能兜住「写入晚、业务时间旧」的晚到消息）；
-                每轮拿到消息后按会话一次处理，同轮新建的待办合并成一条推送；
+                每轮拿到消息后在同一轮内按 LLM 批大小（<code>LLM_BATCH_MESSAGES</code>，默认 40 条/批）分片多次归并，
+                同轮新建的待办合并成一条推送；
                 单条消息处理失败最多重试「重试上限」次，超限进入失败队列并告警，
                 不再阻塞同一会话的后续消息。
+              </p>
+              <p class="hint-line">
+                降级 / 抽取上限 / 未生成待办数只表示本轮待办可能不完整（消息本身没有丢）；
+                「分页读取放大」是分页读到的行数与重复行数，只用于观察读取量，不是数据错误。
               </p>
               <div class="form-actions">
                 <button type="button" id="retryFailedBtn" class="btn-secondary">重试失败队列</button>

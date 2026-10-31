@@ -1304,6 +1304,33 @@
     ]);
   }
 
+  /* 批次 P1：采集降级原因码 → 中文提示（未知码原样展示，避免吞信息） */
+  const DEGRADED_REASON_LABELS = {
+    llm_fallback: 'LLM 已回退规则模式',
+    extraction_cap: '抽取命中 8 事项 / 12 任务上限',
+    partial_failure: '部分会话处理失败',
+    sustained_failure: '连续多轮采集失败',
+    sessions_unavailable: '会话列表读取失败',
+    collect_error: '采集轮异常',
+  };
+
+  function collectionPayload(health) {
+    if (health.collection && typeof health.collection === 'object'
+      && !Array.isArray(health.collection)) return health.collection;
+    if (health.catchup && typeof health.catchup === 'object'
+      && !Array.isArray(health.catchup)) return health.catchup;
+    return {};
+  }
+
+  function degradedReasonLabels(collection) {
+    if (!collection || typeof collection !== 'object' || !Array.isArray(collection.degraded_reasons)) {
+      return [];
+    }
+    return collection.degraded_reasons
+      .map((code) => (code ? (DEGRADED_REASON_LABELS[code] || String(code)) : ''))
+      .filter((text) => text !== '');
+  }
+
   /* 批次 4：数据源状态提示（非错误横幅，demo 实例不显示） */
   function buildDataSourceBanner() {
     if (!state.loaded || state.error || !state.health) return null;
@@ -1322,6 +1349,41 @@
         detail: truncateText(source.last_error, 80),
         showSettings: true,
       });
+    }
+    /* 契约 P1 优先级：数据源未连接（上面）→ source.last_error（部分会话失败 / 处理错误）
+       → collection.degraded（LLM 回退 / 抽取上限等） */
+    const sourceErrorText = typeof source.last_error === 'string'
+      ? truncateText(source.last_error, 80)
+      : '';
+    if (sourceErrorText) {
+      return buildBanner('warn', '采集不完整：部分会话读取或处理失败，待办可能不完整', {
+        detail: sourceErrorText,
+        showSettings: true,
+      });
+    }
+    /* 批次 P1：数据源正常但本轮采集降级（LLM 回退 / 抽取上限等），
+       待办可能不完整，用 warn 横幅提示 */
+    const collection = collectionPayload(health);
+    if (collection.degraded === true) {
+      const reasons = degradedReasonLabels(collection);
+      const last = collection.last && typeof collection.last === 'object'
+        && !Array.isArray(collection.last) ? collection.last : {};
+      const rawLlmError = collection.last_llm_error || last.last_llm_error;
+      const lastLlmError = typeof rawLlmError === 'string' ? truncateText(rawLlmError, 80) : '';
+      const detailBits = [];
+      if (lastLlmError) detailBits.push(`最近 LLM 错误：${lastLlmError}`);
+      if (collection.partial === true && !reasons.some((text) => text.includes('部分会话'))) {
+        detailBits.push('仅部分会话失败，其余会话已正常处理');
+      }
+      return buildBanner('warn',
+        reasons.length
+          ? `采集降级：${reasons.join('、')}，待办可能不完整`
+          : '采集降级：本轮有会话处理失败或 LLM 已回退规则模式，待办可能不完整', {
+          detail: detailBits.length
+            ? detailBits.join(' · ')
+            : '采集会自动重试当前轮并继续下一轮，去设置页「运行状态 → 采集」查看明细',
+          showSettings: true,
+        });
     }
     return null;
   }

@@ -14,7 +14,8 @@ from .utils import now_iso, now_local, parse_iso, to_iso
 logger = logging.getLogger(__name__)
 
 # 用户手动添加的待办：网页「手动添加」、手机 App「手机添加」。
-# 这类任务的标题 / 截止时间是用户亲手填的，自动流程只允许补空白字段，绝不改已有内容。
+# 自动流程默认只补空白字段；但模型明确识别到「改期/新的截止时间」时，
+# 允许覆盖用户已填的截止时间（supplement_task(overwrite_due=True)），标题与备注仍不覆盖。
 MANUAL_GROUPS = ("手动添加", "手机添加")
 
 
@@ -841,7 +842,7 @@ class Database:
             row = self.conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         return self._task_dict(row)
 
-    # ---------- 手动待办：自动补充（只补空白，不改用户填的内容） ----------
+    # ---------- 手动待办：自动补充（默认只补空白；明确改期可覆盖截止时间） ----------
     def list_manual_pending(self, limit: int = 20) -> list[dict]:
         """未完成的手动待办（最近创建的在前），用于自动补充 / 新建去重。"""
         marks = ",".join("?" for _ in MANUAL_GROUPS)
@@ -870,9 +871,12 @@ class Database:
 
     def supplement_task(self, task_id: str, *, due_at: str | None = None,
                         notes: str | None = None, source_msg_ids: list[str] | None = None,
-                        match_reason: str = "") -> tuple[dict | None, list[str]]:
-        """只给手动待办补空白字段：标题 / 已有截止时间 / 已有备注一律不动。
+                        match_reason: str = "",
+                        overwrite_due: bool = False) -> tuple[dict | None, list[str]]:
+        """给手动待办补字段，默认只补空白：标题 / 备注一律不覆盖。
 
+        overwrite_due=True 时允许用 due_at 覆盖已有截止时间（用于模型明确识别到
+        “改到周五/延到下周”这类改期）；不传该参数时与旧行为一致，只补空。
         返回 (任务, 本次实际写入的字段名列表)；无变化时字段列表为空。
         """
         now = now_iso()
@@ -883,7 +887,8 @@ class Database:
             current = self._task_dict(row)
             fields: dict = {}
             changed: list[str] = []
-            if due_at and not str(current.get("due_at") or "").strip():
+            current_due = str(current.get("due_at") or "").strip()
+            if due_at and current_due != str(due_at) and (overwrite_due or not current_due):
                 fields["due_at"] = due_at
                 changed.append("due_at")
             if notes and not str(current.get("notes") or "").strip():

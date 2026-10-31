@@ -1,5 +1,38 @@
+import asyncio
+import logging
+
+import httpx
+
 from app.config import Settings
 from app.wcda import WcdaClient
+
+
+def _sessions_response(status_code: int, payload: dict | None = None) -> httpx.Response:
+    """构造本地 httpx.Response（不发真实网络）：200 走正常解析，5xx 由 raise_for_status 抛错。"""
+    request = httpx.Request("GET", "http://127.0.0.1:10392/api/chat/sessions")
+    return httpx.Response(status_code, request=request,
+                          json=payload if payload is not None else {})
+
+
+def _patch_sessions_http(monkeypatch, response: httpx.Response,
+                         captured: dict | None = None) -> None:
+    """把 httpx.AsyncClient 换成替身：返回固定响应，单测绝不发真实网络。"""
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+        async def get(self, url, **kwargs):
+            if captured is not None:
+                captured.update(url=url, **kwargs)
+            return response
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
 
 
 def _payload(message: dict, **extra) -> dict:
@@ -195,3 +228,58 @@ def test_convert_api_message_for_catchup():
     assert message["content"] == "11月1日科创破冰活动人数统计"
     assert message["link_title"] == "11月1日科创破冰活动人数统计"
     assert message["ts"] == 1792767783
+
+
+# ---------- fetch_sessions_result：区分「接口失败」与「真的没有会话」（P1-3） ----------
+def test_fetch_sessions_result_not_configured():
+    """未配置时明确返回 not_configured，而不是伪装成「没有会话」。"""
+    client = WcdaClient(Settings(wcda_base=""))
+    result = asyncio.run(client.fetch_sessions_result())
+    assert result == {"ok": False, "sessions": [], "error": "not_configured"}
+
+
+def test_fetch_sessions_result_http_500_is_failure(monkeypatch, caplog):
+    """sessions 接口 500：ok=False 且 error 非空；fetch_sessions 保持向后兼容返回 []。"""
+    client = WcdaClient(Settings(wcda_base="http://127.0.0.1:10392"))
+    _patch_sessions_http(monkeypatch, _sessions_response(500))
+    with caplog.at_level(logging.WARNING, logger="app.wcda"):
+        result = asyncio.run(client.fetch_sessions_result())
+        sessions = asyncio.run(client.fetch_sessions())
+    assert result["ok"] is False
+    assert result["sessions"] == []
+    assert result["error"]
+    assert "HTTPStatusError" in result["error"]
+    assert len(result["error"]) <= 200  # 契约：error 截断到 200 字符
+    assert sessions == []
+    # 原有 warning 日志保留，便于排查接口故障
+    assert "读取 WeChatDataAnalysis 会话列表失败" in caplog.text
+
+
+def test_fetch_sessions_result_empty_is_success(monkeypatch):
+    """HTTP 200 空 sessions 是「成功但没会话」，必须与接口失败区分开。"""
+    client = WcdaClient(Settings(wcda_base="http://127.0.0.1:10392"))
+    _patch_sessions_http(monkeypatch, _sessions_response(200, {"sessions": []}))
+    result = asyncio.run(client.fetch_sessions_result())
+    assert result["ok"] is True
+    assert result["sessions"] == []
+    assert result["error"] is None
+
+
+def test_fetch_sessions_result_returns_sessions(monkeypatch):
+    """HTTP 200 正常会话：原样返回，且请求参数/分页语义不变（limit 透传）。"""
+    rows = [
+        {"username": "123@chatroom", "name": "项目群", "isTop": True, "isGroup": True},
+        {"username": "wxid_b", "name": "张三", "isTop": False, "isGroup": False},
+    ]
+    client = WcdaClient(Settings(wcda_base="http://127.0.0.1:10392"))
+    captured: dict = {}
+    _patch_sessions_http(monkeypatch, _sessions_response(200, {"sessions": rows}),
+                         captured)
+    result = asyncio.run(client.fetch_sessions_result())
+    assert result["ok"] is True
+    assert result["error"] is None
+    assert result["sessions"] == rows
+    assert asyncio.run(client.fetch_sessions()) == rows
+    assert captured["url"].endswith("/api/chat/sessions")
+    assert captured["params"]["limit"] == 500
+    assert captured["headers"]["Accept"] == "application/json"

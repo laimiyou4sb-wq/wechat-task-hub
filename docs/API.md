@@ -115,22 +115,44 @@ Body（字段都可选）：
                  "watermarks": 14, "cursor_sessions": 14,
                  "pending_messages": 3, "pending_sessions": 2,
                  "failed_messages": 0, "failed_sessions": 0,
+                 "degraded": false, "degraded_reasons": [], "partial": false,
+                 "llm_batches": 3, "llm_fallbacks": 0, "llm_fallback_total": 0,
+                 "last_llm_error": null, "llm_fallback_streak": 0,
+                 "extraction_cap_hits": 0, "messages_without_task": 2,
+                 "read_rows": 120, "duplicate_rows": 0, "read_ratio": 1.0,
+                 "llm": {"enabled": true, "configured": true, "batch_messages": 40},
+                 "llm_batch_messages": 40,
+                 "deep_scan": {"minutes": 60, "lookback_minutes": 1440, "disabled": false,
+                               "due": false, "last_at": "2026-10-31T00:50:00",
+                               "last": {"at": "2026-10-31T00:50:00", "inserted": 1,
+                                        "processed": 1, "tasks_created": 0,
+                                        "scanned": 20, "lookback_minutes": 1440}},
                  "last_ok_at": "2026-10-31T01:05:00",
                  "last": {"ok": true, "mode": "watermark", "minutes": 10080, "sessions": 14,
                           "scanned": 120, "inserted": 12, "processed": 10, "pages": 2,
                           "tasks_created": 3, "tasks_updated": 1, "dropped_other": 1,
                           "failed": 0, "dead_lettered": 0, "failed_queue": 0,
                           "budget_exhausted": false, "skipped": [], "pending": 3,
+                          "partial": false, "degraded": false, "degraded_reasons": [],
+                          "llm_batches": 3, "llm_fallbacks": 0, "last_llm_error": null,
+                          "extraction_cap_hits": 0, "messages_without_task": 2,
+                          "read_rows": 120, "duplicate_rows": 0, "read_ratio": 1.0,
+                          "sessions_failed": [], "sessions_failed_count": 0,
                           "duration_ms": 3210, "at": "2026-10-31T01:05:00"}},
   "tasks": {"pending": 5},
-  "version": "0.2.0"
+  "version": "0.3.0"
 }
 ```
 `source` 表示当前启用的数据源；`wcda` 是其明细（兼容字段）；`filters` 是当前监控范围快照。
 
-- `source.connected`：`true` 已连接；`false` 采集轮失败 / 数据源不可达；`null` 首轮采集尚未完成（前端显示「等待首轮采集」）。
-- `source.last_collect_at`：上次采集轮时间（成功或失败，ISO，可为 `null`；与 `collection.last.at` 一致）；`source.last_event_at`：最近一次采集到新消息的时间；`source.last_error`：最近一次错误（无错误为 `null`）。
-- `collection`（`catchup` 是同一 payload 的兼容别名，**deprecated**；前端优先读 `collection`，缺省回退 `catchup`）：`enabled`（是否启用周期采集轮）、`mode`（`watermark` = 按会话 localId 游标 / `off` = 关闭周期轮，此时启动后仍会采一轮）、`seconds`（轮间隔）、`lookback_minutes`（每轮最小回看）、`backfill_minutes`（启动额外回补）、`max_hours`（单会话单轮最长回看）、`page_size`（分页大小）、`round_budget`（每轮处理预算）、`empty_history_hours`（无游标且启动前无历史时的回看窗口）、`overlap_seconds`（退回时间窗时的重叠回看）、`deep_scan_minutes` / `deep_scan_lookback_minutes`（晚到消息深扫间隔 / 回看窗口，`0` = 关闭深扫）、`max_attempts`（单条消息最大重试次数）、`watermarks`（会话游标数）、`cursor_sessions`（已建立 localId 游标的会话数）、`pending_messages` / `pending_sessions`（已入库未处理消息数 / 会话数）、`failed_messages` / `failed_sessions`（失败队列消息数 / 会话数）、`last_ok_at`（上次完全成功时间）、`last`（上次采集结果：`ok`、`mode`、`minutes`、`sessions`、`scanned`、`inserted`、`processed`、`pages`、`tasks_created`、`tasks_updated`、`dropped_other`、`failed`、`dead_lettered`、`failed_queue`、`budget_exhausted`、`skipped`、`pending`、`at`；失败轮 `ok=false` 且带 `reason`；深扫轮带 `deep_scan=true`）。
+- `source.connected`：`true` 已连接 / 数据源可达（个别会话读取或处理失败时仍为 `true`，具体看 `collection.degraded` / `collection.partial`）；`false` 数据源不可达、本轮整体失败或 sessions 接口失败；`null` 首轮采集尚未完成（前端显示「等待首轮采集」）。
+- `source.last_collect_at`：上次采集轮时间（成功或失败，ISO，可为 `null`；与 `collection.last.at` 一致）；`source.last_event_at`：最近一次采集到新消息的时间；`source.last_error`：最近一次数据源 / 处理错误（无错误为 `null`；非空且 `connected=true` 时表示部分会话失败）；**LLM 回退不会写进 `source.last_error`，而是写在 `collection.last_llm_error`**。
+- `collection`（`catchup` 是同一 payload 的兼容别名，**deprecated**；前端优先读 `collection`，缺省回退 `catchup`）：`enabled`（是否启用周期采集轮）、`mode`（`watermark` = 按会话 localId 游标 / `off` = 关闭周期轮，此时启动后仍会采一轮）、`seconds`（轮间隔）、`lookback_minutes`（每轮最小回看）、`backfill_minutes`（启动额外回补）、`max_hours`（单会话单轮最长回看）、`page_size`（分页大小）、`round_budget`（每轮处理预算）、`empty_history_hours`（无游标且启动前无历史时的回看窗口）、`overlap_seconds`（退回时间窗时的重叠回看）、`deep_scan_minutes` / `deep_scan_lookback_minutes`（晚到消息深扫间隔 / 回看窗口，`0` = 关闭深扫）、`max_attempts`（单条消息最大重试次数）、`watermarks`（会话游标数）、`cursor_sessions`（已建立 localId 游标的会话数）、`pending_messages` / `pending_sessions`（已入库未处理消息数 / 会话数）、`failed_messages` / `failed_sessions`（失败队列消息数 / 会话数）、`last_ok_at`（上次完全成功时间）、`last`（上次采集结果：`ok`、`mode`、`minutes`、`sessions`、`scanned`、`inserted`、`processed`、`pages`、`tasks_created`、`tasks_updated`、`dropped_other`、`failed`、`dead_lettered`、`failed_queue`、`budget_exhausted`、`skipped`、`pending`、`partial`、`degraded`、`degraded_reasons`、`llm_batches`、`llm_fallbacks`、`last_llm_error`、`extraction_cap_hits`、`messages_without_task`、`read_rows`、`duplicate_rows`、`sessions_failed`、`sessions_failed_count`、`read_ratio`、`at`；失败轮 `ok=false` 且带 `reason`；深扫轮带 `deep_scan=true`）。
+- **`ok` / `partial` / `degraded` 语义（P1）**：`last.ok=false` 表示「本轮有会话读取 / 处理失败」（含**部分失败**、整体性失败、sessions 接口失败）；`last.partial=true` 表示本轮仍有消息被处理（即部分成功，失败只影响部分会话）；`sessions_failed` 是失败会话 id 列表（最多 20 个）、`sessions_failed_count` 是失败会话数；`degraded=true` 表示本轮出现了降级原因（部分失败 / sessions 接口失败 / LLM 回退 / 抽取上限 / 采集轮异常）。**仅 LLM 调用失败回退规则提取时 `ok=true` 但 `degraded=true` 且 `last_llm_error` 非空**。`degraded_reasons` 取值码：`llm_fallback`（LLM 回退规则模式）、`extraction_cap`（抽取命中「8 事项 / 12 任务」上限，可能漏建）、`partial_failure`（部分会话失败）、`sustained_failure`（连续多轮整体性失败）、`sessions_unavailable`（会话列表接口失败）、`collect_error`（采集轮未捕获异常，`reason` 为异常信息）。
+- `collection.llm_batches` / `llm_fallbacks`：上一轮 LLM 分片数 / 回退规则模式次数；`llm_fallback_total`（进程累计）、`llm_fallback_streak`（连续回退轮数）、`last_llm_error`（最近一次 LLM 错误，无则 `null`）；`collection.llm` 给出 `enabled`（是否启用）、`configured`（是否已配置可用 Key）、`batch_messages`（`LLM_BATCH_MESSAGES`，默认 40 条/批），`collection.llm_batch_messages` 是同一值的便捷别名；顶层 `llm.configured` 是旧字段（是否启用 LLM）。
+- `collection.extraction_cap_hits` / `messages_without_task`（上一轮）：抽取命中「8 事项 / 12 任务」上限的次数、已处理但未生成待办的消息条数——只表示待办可能漏建，不是数据错误。
+- `collection.read_rows` / `duplicate_rows` / `read_ratio`（上一轮）：分页读取到的行数 / 其中与已入库重复的行数 / 读取放大倍数；分页读取放大只是观测值（按 createTime 翻页所致），不是数据错误。
+- `collection.deep_scan`：`minutes` / `lookback_minutes`（深扫间隔 / 回看窗口）、`disabled`（是否关闭）、`due`（本轮是否到期待扫）、`last_at`（上次深扫时间）、`last`（上次深扫结果：`at`、`lookback_minutes`、`scanned`、`inserted`、`processed`、`tasks_created`；未执行过为 `null`；**深扫失败时 `last` 带 `error`、没有 `last_at`**）。
 - `events.pending_messages` / `events.pending_sessions`：已入库未处理的消息数 / 会话数；`events.failed_messages` / `events.failed_sessions`：失败队列（重试超限）的消息数 / 会话数。
 
 ### 5.1 LLM 设置（网页设置页使用，需要鉴权）
@@ -258,10 +280,10 @@ Body（字段都可选）：
 - **首次建立游标 / 游标失效**（localId 重装 / 换库 / 回绕）：回退时间窗重采，并把游标重设为本批最大 localId——无游标时用「启动前已入库」的最新消息时间续采；启动前也没有该会话历史时回看 `WCDA_CATCHUP_EMPTY_HISTORY_HOURS`（默认 24 小时）；单会话单轮最长回看 `WCDA_CATCHUP_MAX_HOURS`（默认 168 小时），按 `WCDA_CATCHUP_PAGE_SIZE`（默认 500 条/页）分页；
 - **晚到消息深扫**：因分页按 createTime 排序，晚到消息可能落在游标扫描深度之外，故每 `WCDA_DEEP_SCAN_MINUTES`（默认 60 分钟，`0` = 关闭）按 `WCDA_DEEP_SCAN_LOOKBACK_MINUTES`（默认 1440 分钟）时间窗重扫一次；深扫**不推进 localId 游标**，靠 `rawid` 去重，不会重复建待办；深扫轮的 `last.deep_scan=true`。**晚到消息的兜底上限就是这个深扫回看窗口（默认 24 小时），不是 `WCDA_CATCHUP_MAX_HOURS`（168 小时）**；断网 / 休眠更久后补同步的晚到消息需调大 `WCDA_DEEP_SCAN_LOOKBACK_MINUTES`，代价是每次深扫多翻页；
 - 每轮最多处理约 `WCDA_CATCHUP_ROUND_BUDGET`（默认 2000 条），没处理完的消息保留 `processed=0`，下一轮从 DB 自动兜底继续；
-- 每轮拿到消息后**按会话一次处理**（不再按条数切批）；**同轮新建的待办在轮末合并成一条推送**（标题「微信待办 +N」，最多 6 条明细），采集轮之外的即时推送行为不变；
+- 每轮拿到消息后**在同一轮内按 `LLM_BATCH_MESSAGES`（默认 40 条/批）分片多次归并**（跨分片共用事项账本，不再按会话一次处理、也不是每个分片单独推送）；**同轮新建的待办在轮末合并成一条推送**（标题「微信待办 +N」，最多 6 条明细），采集轮之外的即时推送行为不变；
 - `window` 模式（新置顶回补 / 启动额外回补 / 晚到消息深扫）**不推进游标**，不会影响增量采集；
 - 已采集消息入库时 `processed=0`；处理成功后置 `processed=1`；`existing_message_ids` 只跳过 `processed=1`（已处理）与 `processed=2`（失败队列），`processed=0` 的消息每轮自动兜底重试；失败队列的详细语义见 5.6；
-- **失败重试与失败队列**：小批次（≤30 条）整批失败后逐条隔离重试，能处理的立即处理；**大积压（>30 条）先隔离探测前 30 条**——探测样本**全部**失败视为 LLM / 网络等整体性故障，本轮只写 `last_error`、**不增加 attempts**，下一轮自动重试（不会把积压灌进失败队列）；样本里有成功则按毒消息累计 attempts，多轮逐批排空。连续 3 轮仍整体性失败会推送「采集持续失败」high 告警（`source.last_error` 同步记录，采集轮 `ok` 仍为 `true` 但 `last_error` 非空），避免静默卡住。单条消息累计失败 `MESSAGE_MAX_ATTEMPTS`（默认 3）次后置 `processed=2` 进失败队列，并推送 high 优先级告警（不受免打扰限制），不再阻塞同一会话后续消息；
+- **失败重试与失败队列**：小批次（≤30 条）整批失败后逐条隔离重试，能处理的立即处理；**大积压（>30 条）先隔离探测前 30 条**——探测样本**全部**失败视为 LLM / 网络等整体性故障，本轮只记错误、**不增加 attempts**，下一轮自动重试（不会把积压灌进失败队列）；样本里有成功则按毒消息累计 attempts，多轮逐批排空。连续 3 轮仍整体性失败会推送「采集持续失败」high 告警，并把本轮结果标记为 **`last.ok=false` + `degraded=true`**（`partial=true` 表示本轮仍有消息被处理；`degraded_reasons` 给出 `partial_failure` / `sustained_failure` 等原因码，`source.last_error` 同步记录），**不再出现「`ok` 仍为 true 但 `last_error` 非空」的静默态**；设置页「上次采集」与主页横幅都会显示降级 / 失败原因。单条消息累计失败 `MESSAGE_MAX_ATTEMPTS`（默认 3）次后置 `processed=2` 进失败队列，并推送 high 优先级告警（不受免打扰限制），不再阻塞同一会话后续消息；
 - 幂等：任务按 `dedupe_key` 去重；读取失败 / 积压超过 `WCDA_CATCHUP_MAX_MESSAGES` 的会话保留原游标，下一轮自动重试。
 
 `GET /api/collect/state`（主接口，需要鉴权；`GET /api/catchup/state` 为兼容别名，**deprecated**，返回同一 payload）
@@ -298,16 +320,19 @@ Body（字段都可选）：
 | `WCDA_DEEP_SCAN_MINUTES` | `60` | 晚到消息深扫间隔（分钟；0=关闭）：按时间窗重扫、不推进游标 |
 | `WCDA_DEEP_SCAN_LOOKBACK_MINUTES` | `1440` | 深扫回看窗口（分钟，默认 24 小时）；晚到消息兜底上限就是它（不是 `WCDA_CATCHUP_MAX_HOURS`），断网更久需调大（代价：每次深扫多翻页） |
 | `MESSAGE_MAX_ATTEMPTS` | `3` | 单条消息处理失败最大重试次数，超限进失败队列并告警 |
+| `LLM_BATCH_MESSAGES` | `40` | 同一轮内 LLM 归并分片大小（条/批；0=不分批，旧行为）。分片避免单次 prompt 过大及「8 事项 / 12 任务」上限在洪峰下静默饱和，命中上限会计入 `extraction_cap_hits` |
 
 后台默认每 `WCDA_CATCHUP_SECONDS`（120 秒）按 localId 游标自动采集一次；服务启动 8 秒后会先按游标采一次
 （开机/断网恢复后自动追赶）；`WCDA_BACKFILL_MINUTES>0` 时再额外按「固定窗口」补一次（不推进游标）。
-`GET /api/health` 的 `collection` 字段（`catchup` 为兼容别名，deprecated）会显示是否启用、参数、游标会话数、待处理消息/会话数、失败队列与最近一次结果。
+`GET /api/health` 的 `collection` 字段（`catchup` 为兼容别名，deprecated）会显示是否启用、参数、游标会话数、待处理消息/会话数、失败队列与最近一次结果，
+以及降级 / 回退 / 抽取上限 / 读取放大等可观测字段（`degraded`、`degraded_reasons`、`partial`、`llm_batches`、`llm_fallbacks`、`llm_fallback_total`、`llm_fallback_streak`、`last_llm_error`、`extraction_cap_hits`、`messages_without_task`、`read_rows`、`duplicate_rows`、`read_ratio`、`llm`、`llm_batch_messages`、`deep_scan`，见 5 节字段说明）。
+`GET /api/collect/state` 的 `last` 与 `collection.last` 同结构，同样含 `partial` / `degraded` / `degraded_reasons` / `llm_batches` / `llm_fallbacks` / `last_llm_error` / `extraction_cap_hits` / `messages_without_task` / `read_rows` / `duplicate_rows` / `read_ratio` / `sessions_failed` / `sessions_failed_count`。
 
 ### 5.6 失败队列（重试超限的消息，需要鉴权）
 
 消息处理状态 `messages.processed`：`0` = 已入库待处理、`1` = 已处理（过滤/归并决策完成）、`2` = 失败队列（重试超限，不再自动重试，需人工重试回到待处理）。
 
-> 整体性故障（大积压整批失败且前 30 条隔离探测样本全部失败，如 LLM / 网络中断）只更新 `last_error`、**不消耗 attempts**，不会进入失败队列，下一轮采集自动重试。
+> 整体性故障（大积压整批失败且前 30 条隔离探测样本全部失败，如 LLM / 网络中断）不消耗 attempts、不会进入失败队列，下一轮采集自动重试；同时本轮采集会标记 `last.ok=false` + `degraded=true`（`partial=true` 表示仍有进展；`degraded_reasons` 给出原因码），并在 `last_llm_error` / `source.last_error` 记录原因。
 
 `GET /api/collect/failed?limit=100&offset=0`
 

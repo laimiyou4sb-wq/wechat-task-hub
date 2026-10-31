@@ -173,6 +173,9 @@ class Settings:
     llm_api_key: str = ""
     llm_model: str = "deepseek-chat"
     llm_timeout: int = 60
+    # 归并分片：同一会话一轮消息按该条数分片、每片独立归并，避免单次 prompt 过大
+    # 以及「最多 8 个事项 / 12 个任务」上限在洪峰下静默饱和；0 = 不切批（旧行为）
+    llm_batch_messages: int = 40
 
     bark_url: str = ""
     ntfy_server: str = "https://ntfy.sh"
@@ -245,6 +248,7 @@ class Settings:
             llm_api_key=llm_key,
             llm_model=_get("LLM_MODEL", "deepseek-chat"),
             llm_timeout=_int("LLM_TIMEOUT", 60),
+            llm_batch_messages=max(0, min(_int("LLM_BATCH_MESSAGES", 40), 500)),
             bark_url=_get("PUSH_BARK_URL").rstrip("/"),
             ntfy_server=_get("NTFY_SERVER", "https://ntfy.sh").rstrip("/"),
             ntfy_topic=_get("NTFY_TOPIC"),

@@ -776,6 +776,23 @@
     off: '已关闭',
   };
 
+  /* 采集降级原因码 → 中文提示（未知码原样展示，避免吞信息） */
+  const DEGRADED_REASON_LABELS = {
+    llm_fallback: 'LLM 回退规则模式',
+    extraction_cap: '抽取命中上限',
+    partial_failure: '部分会话失败',
+    sustained_failure: '连续多轮失败',
+    sessions_unavailable: '会话列表不可用',
+    collect_error: '采集轮异常',
+  };
+
+  function degradedReasons(value) {
+    if (!value || typeof value !== 'object' || !Array.isArray(value.degraded_reasons)) return [];
+    return value.degraded_reasons
+      .map((code) => (code ? (DEGRADED_REASON_LABELS[code] || String(code)) : ''))
+      .filter((text) => text !== '');
+  }
+
   let statusBusy = false;
   const STATUS_BUTTONS = ['#pinnedRefreshBtn', '#statusRefreshBtn', '#retryFailedBtn'];
 
@@ -784,6 +801,18 @@
     return value !== null && value !== undefined && value !== '' && Number.isFinite(number)
       ? String(number)
       : '—';
+  }
+
+  function statusCountText(value, unit) {
+    const text = statusNumber(value);
+    return text === '—' ? text : `${text} ${unit}`;
+  }
+
+  function truncateStatusText(value, max = 80) {
+    if (typeof value !== 'string' && typeof value !== 'number') return '';
+    const text = String(value).replace(/\s+/g, ' ').trim();
+    if (!text) return '';
+    return text.length > max ? `${text.slice(0, max).trimEnd()}…` : text;
   }
 
   function statusTime(value) {
@@ -838,11 +867,16 @@
     const health = data && typeof data === 'object' ? data : {};
     const source = health.source && typeof health.source === 'object' ? health.source : {};
     const collection = health.collection && typeof health.collection === 'object'
+      && !Array.isArray(health.collection)
       ? health.collection
-      : (health.catchup && typeof health.catchup === 'object' ? health.catchup : {});
+      : (health.catchup && typeof health.catchup === 'object' && !Array.isArray(health.catchup)
+        ? health.catchup : {});
     const whitelist = health.whitelist && typeof health.whitelist === 'object' ? health.whitelist : {};
     const events = health.events && typeof health.events === 'object' ? health.events : {};
     const llm = health.llm && typeof health.llm === 'object' ? health.llm : {};
+    /* 分片/启用信息按契约在 collection.llm（顶层 llm 只有 configured 的旧结构也能兼容） */
+    const collectionLlm = collection.llm && typeof collection.llm === 'object'
+      && !Array.isArray(collection.llm) ? collection.llm : {};
     const tasks = health.tasks && typeof health.tasks === 'object' ? health.tasks : {};
 
     const connected = source.connected;
@@ -934,13 +968,115 @@
       ? '—'
       : `${statusNumber(collection.failed_sessions)} 个`);
 
+    const last = collection.last && typeof collection.last === 'object'
+      && !Array.isArray(collection.last)
+      ? collection.last
+      : null;
+    /* 失败会话数：后端 collection.last 里 sessions_failed 是会话 id 数组，
+       数量在 sessions_failed_count（旧结构直接给数字时也兼容） */
+    const lastSessionsFailed = last
+      ? (last.sessions_failed_count !== undefined && last.sessions_failed_count !== null
+        ? last.sessions_failed_count
+        : (Array.isArray(last.sessions_failed)
+          ? last.sessions_failed.length
+          : last.sessions_failed))
+      : undefined;
+    /* 上一轮指标：优先读 collection 顶层，缺失时回退 collection.last（字段契约未就绪也不报错） */
+    const statOf = (name) => {
+      const value = collection[name];
+      if (value !== undefined && value !== null) return value;
+      return last ? last[name] : undefined;
+    };
+
+    const collectionReasons = degradedReasons(collection);
+    const lastReasons = degradedReasons(last);
+    const degradedReasonList = collectionReasons.length ? collectionReasons : lastReasons;
+    const degraded = collection.degraded === true;
+    statusSet('#statusDegraded', degraded
+      ? `降级 · ${degradedReasonList.length ? degradedReasonList.join('、') : '原因未提供'}`
+      : collection.degraded === false ? '正常' : '—');
+
+    const llmFallbackBits = [];
+    if (statusNumber(statOf('llm_batches')) !== '—') {
+      llmFallbackBits.push(`本轮 ${statusNumber(statOf('llm_batches'))} 批`);
+    }
+    if (statusNumber(statOf('llm_fallbacks')) !== '—') {
+      llmFallbackBits.push(`回退 ${statusNumber(statOf('llm_fallbacks'))} 次`);
+    }
+    if (statusNumber(collection.llm_fallback_total) !== '—') {
+      llmFallbackBits.push(`累计 ${statusNumber(collection.llm_fallback_total)} 次`);
+    }
+    const fallbackStreak = Number(collection.llm_fallback_streak);
+    if (Number.isFinite(fallbackStreak) && fallbackStreak > 0) {
+      llmFallbackBits.push(`连续 ${statusNumber(fallbackStreak)} 轮`);
+    }
+    statusSet('#statusLlmFallback', llmFallbackBits.length ? llmFallbackBits.join(' · ') : '—');
+
+    statusSet('#statusCapHits', statusCountText(statOf('extraction_cap_hits'), '次'));
+    statusSet('#statusMessagesWithoutTask', statusCountText(statOf('messages_without_task'), '条'));
+
+    const deepScanState = collection.deep_scan && typeof collection.deep_scan === 'object'
+      && !Array.isArray(collection.deep_scan)
+      ? collection.deep_scan
+      : null;
+    const deepScanLast = deepScanState && deepScanState.last && typeof deepScanState.last === 'object'
+      && !Array.isArray(deepScanState.last)
+      ? deepScanState.last
+      : null;
+    let deepScanLastText = '—';
+    if (deepScanState) {
+      if (deepScanState.disabled === true) {
+        deepScanLastText = '已关闭';
+      } else if (!deepScanLast) {
+        deepScanLastText = deepScanState.last_at ? `上次 ${statusTime(deepScanState.last_at)}` : '尚未执行';
+      } else {
+        const deepScanError = truncateStatusText(deepScanLast.error, 60);
+        if (deepScanError) {
+          /* 深扫失败：last.error 有值、没有 last_at */
+          deepScanLastText = `失败 · ${deepScanError}`;
+        } else {
+          const atText = statusTime(deepScanLast.at) !== '—'
+            ? statusTime(deepScanLast.at)
+            : statusTime(deepScanState.last_at);
+          const deepScanBits = [atText !== '—' ? atText : '时间未知'];
+          if (statusNumber(deepScanLast.inserted) !== '—') {
+            deepScanBits.push(`补回 ${statusNumber(deepScanLast.inserted)} 条`);
+          }
+          if (statusNumber(deepScanLast.processed) !== '—') {
+            deepScanBits.push(`处理 ${statusNumber(deepScanLast.processed)} 条`);
+          }
+          deepScanLastText = deepScanBits.join(' · ');
+        }
+      }
+    }
+    statusSet('#statusDeepScanLast', deepScanLastText);
+
+    const readBits = [];
+    if (statusNumber(statOf('read_rows')) !== '—') {
+      readBits.push(`读取 ${statusNumber(statOf('read_rows'))} 行`);
+    }
+    if (statusNumber(statOf('duplicate_rows')) !== '—') {
+      readBits.push(`重复 ${statusNumber(statOf('duplicate_rows'))} 行`);
+    }
+    const readRatio = Number(statOf('read_ratio'));
+    if (Number.isFinite(readRatio) && readRatio > 0) {
+      readBits.push(`放大 ${readRatio.toFixed(1)}×`);
+    }
+    statusSet('#statusReadAmplification', readBits.length ? readBits.join(' / ') : '—');
+
     const collectionLastEl = $('#statusCatchupLast');
     if (collectionLastEl) {
-      const last = collection.last && typeof collection.last === 'object' ? collection.last : null;
       if (!last) {
         collectionLastEl.textContent = '上次采集：尚未执行';
       } else if (last.ok === false) {
-        collectionLastEl.textContent = `上次采集失败：${last.reason || last.error || '未知原因'}`;
+        const failureBits = [String(last.reason || last.error || '未知原因')];
+        if (last.partial === true) failureBits.push('仅部分会话失败');
+        if (statusNumber(lastSessionsFailed) !== '—' && Number(lastSessionsFailed) > 0) {
+          failureBits.push(`失败会话 ${statusNumber(lastSessionsFailed)} 个`);
+        }
+        const lastLlmError = truncateStatusText(last.last_llm_error, 80);
+        if (lastLlmError) failureBits.push(`LLM 错误：${lastLlmError}`);
+        collectionLastEl.textContent = `上次采集失败：${failureBits.join(' · ')}`;
       } else {
         const modeLabel = last.deep_scan
           ? '晚到消息深扫'
@@ -961,9 +1097,32 @@
         if (last.budget_exhausted) parts.push('本轮预算用完，余量下轮继续');
         if (last.dead_lettered) parts.push(`失败入队 ${statusNumber(last.dead_lettered)} 条`);
         if (last.failed_queue) parts.push(`失败队列 ${statusNumber(last.failed_queue)} 条`);
+        if (last.partial === true) parts.push('部分会话失败');
+        if (statusNumber(lastSessionsFailed) !== '—' && Number(lastSessionsFailed) > 0) {
+          parts.push(`失败会话 ${statusNumber(lastSessionsFailed)} 个`);
+        }
+        if (statusNumber(last.llm_fallbacks) !== '—' && Number(last.llm_fallbacks) > 0) {
+          parts.push(`LLM 回退 ${statusNumber(last.llm_fallbacks)} 次`);
+        }
+        if (statusNumber(last.extraction_cap_hits) !== '—' && Number(last.extraction_cap_hits) > 0) {
+          parts.push(`抽取上限 ${statusNumber(last.extraction_cap_hits)} 次`);
+        }
+        if (statusNumber(last.messages_without_task) !== '—' && Number(last.messages_without_task) > 0) {
+          parts.push(`未生成待办 ${statusNumber(last.messages_without_task)} 条`);
+        }
         const skipped = Array.isArray(last.skipped) ? last.skipped.length : 0;
         if (skipped > 0) parts.push(`跳过 ${skipped} 个会话`);
-        collectionLastEl.textContent = `上次采集：成功 · ${parts.join(' · ')} · ${statusTime(last.at)}`;
+        const roundDegraded = last.degraded === true || (last.degraded === undefined && degraded);
+        let prefix = '上次采集：成功';
+        if (roundDegraded) {
+          const reasonText = lastReasons.length
+            ? lastReasons.join('、')
+            : (last.last_llm_error
+              ? truncateStatusText(last.last_llm_error, 60)
+              : '原因未提供');
+          prefix = `上次采集：降级（${reasonText}）`;
+        }
+        collectionLastEl.textContent = `${prefix} · ${parts.join(' · ')} · ${statusTime(last.at)}`;
       }
     }
 
@@ -983,7 +1142,26 @@
     statusSet('#statusBufferedSessions', statusNumber(events.pending_sessions));
     statusSet('#statusBufferedMessages', statusNumber(events.pending_messages));
 
-    statusSet('#statusLlm', llm.configured === true ? '已配置' : llm.configured === false ? '未配置' : '—');
+    /* 顶层 llm.configured 旧字段表示“是否启用”；collection.llm.configured 才表示“已配置 Key”，优先后者 */
+    const llmConfiguredValue = collectionLlm.configured !== undefined
+      ? collectionLlm.configured
+      : (llm.configured !== undefined ? llm.configured : collectionLlm.enabled);
+    const llmConfiguredText = llmConfiguredValue === true
+      ? '已配置'
+      : llmConfiguredValue === false ? '未配置' : '—';
+    const llmBatchValue = llm.batch_messages !== undefined
+      ? llm.batch_messages
+      : (collectionLlm.batch_messages !== undefined
+        ? collectionLlm.batch_messages
+        : collection.llm_batch_messages);
+    if (statusNumber(llmBatchValue) !== '—') {
+      const batchMessages = Number(llmBatchValue);
+      statusSet('#statusLlm', `${llmConfiguredText} · ${batchMessages > 0
+        ? `${statusNumber(batchMessages)} 条/批`
+        : '不分批'}`);
+    } else {
+      statusSet('#statusLlm', llmConfiguredText);
+    }
     statusSet('#statusTasksPending', tasks.pending === null || tasks.pending === undefined
       ? '—'
       : `${statusNumber(tasks.pending)} 条`);

@@ -68,7 +68,7 @@ def _manual(service: AppService, title: str, *, due: str | None = None,
 
 
 def test_same_relation_supplements_manual_task_without_duplicate(tmp_path, monkeypatch):
-    """几乎相同：细节补进手动待办，不新建重复待办；标题/已有时间不变。"""
+    """几乎相同：细节补进手动待办，不新建重复待办；明确改期时更新截止时间，标题不变。"""
     service = AppService(_settings(tmp_path))
     manual = _manual(service, "科创破冰", due="2026-11-01T18:00:00")
     seen = []
@@ -95,7 +95,7 @@ def test_same_relation_supplements_manual_task_without_duplicate(tmp_path, monke
     assert len(tasks) == 1, "不应新建重复待办"
     task = service.db.get_task(manual["id"])
     assert task["title"] == "科创破冰", "手动标题不能改"
-    assert task["due_at"] == "2026-11-01T18:00:00", "手动填的截止时间不能改"
+    assert task["due_at"] == "2026-11-01T14:00:00", "模型明确给出改期时间 → 覆盖手动已有截止时间"
     assert "11月1日下午2点" in task["notes"], "空白备注应被补上"
     assert task["source_msg_ids"] == ["m1"], "来源消息应追加，详情页可追溯"
     assert task["match_reason"] == "自动补充（来自新消息归并）"
@@ -104,7 +104,7 @@ def test_same_relation_supplements_manual_task_without_duplicate(tmp_path, monke
 
 
 def test_same_relation_fills_blank_due_when_manual_left_it_empty(tmp_path, monkeypatch):
-    """手动没填时间 → 可以自动补；手动填了 → 不改。"""
+    """手动没填时间 → 可以自动补。"""
     service = AppService(_settings(tmp_path))
     manual = _manual(service, "科创破冰")
 
@@ -161,7 +161,7 @@ def test_partial_overlap_splits_into_supplement_plus_new_task(tmp_path, monkeypa
     assert len(tasks) == 2, "手动待办 + 剩余部分新待办"
     manual_task = service.db.get_task(manual["id"])
     assert manual_task["title"] == "科创破冰"
-    assert manual_task["due_at"] == "2026-11-01T18:00:00"
+    assert manual_task["due_at"] == "2026-11-01T14:00:00", "明确改期 → 覆盖手动已有截止时间"
     assert "11月1日下午2点" in manual_task["notes"]
     new_task = next(task for task in tasks if task["id"] != manual["id"])
     assert new_task["title"] == "填写科创破冰人数统计接龙"
@@ -419,3 +419,65 @@ def test_manual_decision_normalizes_due_and_ignores_bad_index():
     assert decisions[0].supplement_due == "2026-11-01T14:00:00"
     assert decisions[0].supplement_notes == "下午两点"
 
+
+
+def test_same_relation_without_explicit_due_keeps_manual_due(tmp_path, monkeypatch):
+    """模型没有明确给出新时间时，候选任务的 due 不能覆盖手动已有截止时间。"""
+    service = AppService(_settings(tmp_path))
+    manual = _manual(service, "科创破冰", due="2026-11-01T18:00:00")
+
+    async def fake_match(candidates, manual_tasks, messages, settings, now=None,
+                         ignored_tasks=None):
+        return [ManualDecision(
+            index=0, relation="same", manual_task_id=manual["id"],
+            supplement_notes="只是再次提醒", supplement_due=None,
+        )]
+
+    monkeypatch.setattr(service_module, "llm_reconcile",
+                        _fake_reconcile_factory("参加科创破冰活动", due="2026-11-01T14:00:00"))
+    monkeypatch.setattr(service_module, "llm_match_manual", fake_match)
+
+    asyncio.run(service.process_batch([_msg("m1", "再提醒一下破冰的事")]))
+
+    task = service.db.get_task(manual["id"])
+    assert task["due_at"] == "2026-11-01T18:00:00", "无明确改期时保持手动时间"
+    assert "只是再次提醒" in task["notes"]
+    service.db.close()
+
+
+def test_supplement_task_overwrite_due_only_when_requested(tmp_path):
+    db = Database(tmp_path / "db-overwrite.db")
+    task, _created = db.create_task(
+        title="科创破冰", notes="", due_at="2026-11-01T18:00:00", group_name="手机添加",
+    )
+    # 默认只补空：已有截止时间不变
+    unchanged, changed = db.supplement_task(task["id"], due_at="2026-11-01T14:00:00")
+    assert "due_at" not in changed
+    assert unchanged["due_at"] == "2026-11-01T18:00:00"
+    # 显式允许覆盖（模型明确识别到改期）
+    updated, changed = db.supplement_task(
+        task["id"], due_at="2026-11-01T14:00:00", overwrite_due=True)
+    assert "due_at" in changed
+    assert updated["due_at"] == "2026-11-01T14:00:00"
+    # 同一时间重复写入不应产生变更（避免 rev 抖动）
+    again, changed_again = db.supplement_task(
+        task["id"], due_at="2026-11-01T14:00:00", overwrite_due=True)
+    assert changed_again == []
+    assert again["due_at"] == "2026-11-01T14:00:00"
+    db.close()
+
+
+def test_manual_match_prompt_allows_explicit_due_override():
+    from datetime import datetime
+
+    from app.extract import ExtractedTask, _build_manual_match_prompt
+
+    candidate = ExtractedTask(title="参加科创破冰活动", source_msg_ids=["m1"])
+    manual = [{"id": "t1", "title": "科创破冰",
+               "due_at": "2026-11-01T18:00:00", "notes": ""}]
+    prompt = _build_manual_match_prompt(
+        [candidate], manual, [_msg("m1", "破冰改到11月1日下午2点")],
+        datetime(2026, 10, 31, 21, 0))
+    assert "supplement_due" in prompt
+    assert "覆盖手动已有的截止时间" in prompt
+    assert "例6" in prompt
